@@ -179,7 +179,7 @@ def tail(s, n):
     return "\n".join(rows(s)[-n:])
 
 
-# ---------- screen model ----------
+# ---------- screen model (fail closed) ----------
 RECENT = {}  # session -> the last few payloads the runner pasted, whitespace removed
 
 
@@ -193,47 +193,92 @@ def _bare(x):
     return x.strip().strip("│").strip().lstrip("›❯>•⏺ ").strip()
 
 
-def regions(s):
-    """(above, footer): rows above the agent's input box and rows below its bottom border.
-    The input line and its wrapped continuation are excluded, and rows that are part of a
-    payload the runner recently pasted (compared with all whitespace removed, so collapsing
-    and wrapping don't matter) are dropped, so the runner's own text can't look like a
-    prompt or a busy spinner."""
-    lines = rows(s)
-    k = None
-    for n in range(len(lines) - 1, max(-1, len(lines) - 30), -1):
-        if INPUT.match(lines[n]) and not MENU.match(lines[n]):
-            k = n
-            break
-    if k is None:
-        above, footer = lines, []
-    else:
-        top = k - 1 if k > 0 and BORDER.match(lines[k - 1]) else k
-        end = next((n for n in range(k + 1, len(lines)) if BORDER.match(lines[n])), None)
-        above, footer = lines[:top], (lines[end + 1:] if end is not None else [])
-    rec = RECENT.get(s, [])
+def _flat(x):
+    return "".join(_bare(x).split())
 
-    def mine(x):
-        t = "".join(_bare(x).split())
-        return len(t) >= 3 and any(t in r for r in rec)
-    return [x for x in above if not mine(x)], [x for x in footer if not mine(x)]
+
+OPT2N = re.compile(r"^\s*(?:│\s*)?[›❯>]?\s*2\.\s+\S")
+
+
+def menuish(x):
+    return bool(OPT1.match(x) or OPT2N.match(x) or YN.search(_bare(x)) or QUESTION.search(x))
+
+
+def find_input(lines, cur=""):
+    """(top, k, end) of the agent's input box, or None.
+
+    Only the LOWEST input-looking line is a candidate, and it counts only if everything below
+    it is: the wrapped continuation of the current unsent paste (cur, whitespace removed), a
+    bottom border, and at most 4 footer rows with no menu or prompt text. Anything else means
+    there is no input box (for example an approval menu replaced it, and the lowest '>' is a
+    transcript line), which the gate treats as a possible prompt."""
+    k = next((n for n in range(len(lines) - 1, max(-1, len(lines) - 30), -1)
+              if INPUT.match(lines[n]) and not MENU.match(lines[n])), None)
+    if k is None:
+        return None
+    n = k + 1
+    while n < len(lines) and cur and not BORDER.match(lines[n]) and _flat(lines[n]) and _flat(lines[n]) in cur:
+        n += 1
+    end = n if n < len(lines) and BORDER.match(lines[n]) else None
+    rest = lines[end + 1:] if end is not None else lines[n:]
+    if any(menuish(x) for x in rest) or len([x for x in rest if x.strip()]) > 4:
+        return None
+    top = k - 1 if k > 0 and BORDER.match(lines[k - 1]) else k
+    return top, k, (end if end is not None else n - 1)
+
+
+def approval_in(lines, cur=""):
+    """None, "no_input", "menu" or "yn". Fails closed: no valid input box = possibly a prompt.
+    Menu detection looks at the last 15 rows of the whole screen, scrollback included; only the
+    input box holding the current unsent paste is excluded (text from earlier pastes is NOT
+    removed, so a quoted '1. Yes 2. No' can't hide a real menu)."""
+    box = find_input(lines, cur)
+    if box is None:
+        return "no_input"
+    top, k, end = box
+    a = [x for x in lines[:top] + lines[end + 1:] if x.strip()][-15:]
+    ones = [n for n, x in enumerate(a) if OPT1.match(x)]
+    if ones and any(OPT2.match(x) for x in a[ones[-1] + 1:]) and (
+            any(MENU.match(x) for x in a) or any(QUESTION.search(x) for x in a)):
+        return "menu"
+    above = [x for x in lines[:top] if x.strip()]
+    if above and YN.search(_bare(above[-1])):
+        return "yn"
+    return None
+
+
+def screen(s):
+    return rows(s), (RECENT.get(s) or [""])[-1]
 
 
 def approval_on(s):
-    above = [x for x in regions(s)[0] if x.strip()][-15:]
-    if not above:
-        return False
-    if YN.search(_bare(above[-1])):  # a real y/n prompt as the last line above the input
-        return True
-    ones = [n for n, x in enumerate(above) if OPT1.match(x)]
-    if ones and any(OPT2.match(x) for x in above[ones[-1] + 1:]):  # numbered menu: 1. then 2. / No
-        return any(QUESTION.search(x) for x in above[:ones[-1] + 1]) or any(MENU.match(x) for x in above)
-    return False
+    return approval_in(*screen(s))
+
+
+def busy_in(lines, rec):
+    """Busy spinner above the input box or in the footer; rows from recent runner pastes are
+    ignored here (a false 'busy' only delays, it never types)."""
+    box = find_input(lines, rec[-1] if rec else "")
+    above, footer = (lines, []) if box is None else (lines[:box[0]], lines[box[2] + 1:])
+
+    def mine(x):
+        t = _flat(x)
+        return len(t) >= 3 and any(t in r for r in rec)
+    return bool(BUSY.search("\n".join([x for x in above if x.strip() and not mine(x)][-12:]
+                                      + [x for x in footer if not mine(x)])))
 
 
 def busy(s):
-    above, footer = regions(s)
-    return bool(BUSY.search("\n".join([x for x in above if x.strip()][-12:] + footer)))
+    return busy_in(rows(s), RECENT.get(s, []))
+
+
+def hook_state(i):
+    """state/<identity>.hook.json written by runner/hooks/board_hook.py, or None."""
+    try:
+        with open(os.path.join(STATE, f"{i}.hook.json")) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def inputline(s):
@@ -278,7 +323,13 @@ def health(i):
     kids = children(pid) if pid.isdigit() else []
     if dead == "1" or not (cmd in AGENT_PROCS or AGENT_PROCS.intersection(kids)):
         return {"problem": "process_dead", "detail": f"pane is running {cmd or '?'}, no agent process"}
-    if approval_on(s):
+    h = hook_state(i)
+    if h and h.get("waiting_approval"):
+        return {"problem": "awaiting_approval", "detail": f"hook reports a permission prompt ({h.get('event')})"}
+    why = approval_on(s)
+    if why == "no_input":
+        return {"problem": "awaiting_approval", "detail": "no input box on screen; possibly a prompt"}
+    if why:
         return {"problem": "awaiting_approval", "detail": "waiting at a confirmation prompt"}
     return {"problem": None, "busy": busy(s)}
 

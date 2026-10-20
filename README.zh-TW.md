@@ -105,9 +105,23 @@ loginctl enable-linger "$USER"
 - 警示預設只送狀態。Pane 內容是對協調者的 prompt injection 管道，所以要明確開啟：設 `RUNNER_ALERT_PANE=1` 時才附 pane 最後幾行，且 token、`key=value` 形式的秘密、長串不透明字串、IPv4 位址和 e-mail 都會被遮蔽。
 - 列在 `RUNNER_SENSITIVE` 的身分（例如處理真實資料的代理）只會收到狀態，絕不附 pane 內容。
 - Runner 只回報，不會重啟代理。畫面上有符合 `RUNNER_APPROVAL_RE` 的確認提示時，它什麼都不輸入（不貼上、不按 Enter、不按 C-u），訊息繼續排隊；自我測試用假代理驗證這點。正規表示式比對不到的提示不在保護範圍內。
-- 「忙碌」和「確認提示」只看代理輸入框上方（忙碌另外看底部狀態列），而且會先去掉 runner 最近貼上的幾則訊息所佔的列，所以內容含 `(y/n)` 或 `esc to interrupt` 的留言板訊息，不會讓代理看起來在忙或停在提示。確認提示需要有結構：問句下方有編號選單（`1.` 後面接 `2.` 或 `No`），或輸入框上方最後一行是 y/n 提示。如果貼上之後才擋下，警示會註明輸入列上還有一則沒送出的留言板訊息。
+- 「忙碌」只看代理輸入框上方和底部狀態列，而且會先去掉 runner 最近貼上的幾則訊息所佔的列；y/n 提示只在它是輸入框上方最後一行時才算。所以內容含 `(y/n)` 或 `esc to interrupt` 的留言板訊息，不會讓代理看起來在忙或停在提示。如果貼上之後才擋下，警示會註明輸入列上還有一則沒送出的留言板訊息。
 - 建議用專用的 `RUNNER_IDENTITY` 發警示。它不能列在 `APPROVERS`、`MERGERS` 或 `SENSITIVE_ALLOWLIST` 裡（也請設定 `MERGERS`，留空代表任何人都能合併），而且讀警示的協調者不要同時擔任核准者或合併者。警示會佔用這個身分的 `RATE_PER_MINUTE` 額度。
-- 下一步計畫：改用 CLI 本身的 hook（Claude Code 的 `Notification` hook、Codex 的 `notify`）取得確認與閒置狀態，不再讀畫面。
+- **閘門 fail closed。** 只有在輸入框下方除了正在貼上的訊息、邊框和不含選單或提示文字的短狀態列之外沒有別的東西時，才算找到輸入框。找不到輸入框時，就暫緩送出、什麼都不輸入，例如確認選單取代了輸入框、最下面的 `>` 其實是對話紀錄。選單偵測看整個畫面最後 15 列，包括捲動紀錄；要有 `1.` 後面接 `2.` 或 `No`，再加上選取游標或問句。只排除輸入列上這一則還沒送出的訊息，所以先前訊息裡引用的 `1. Yes 2. No` 蓋不掉真正的選單。代價是：代理的回覆如果最後是問句加編號清單，送出會暫緩到畫面改變為止，巡檢會發警示告訴你。
+
+**Hooks。** `launch.sh` 會替它啟動的 session 裝上 hook。設定直接放在命令列上，不會動到使用者設定；設 `RUNNER_HOOKS=0` 可以關掉。Hook 會執行 `runner/hooks/board_hook.py <identity>`，寫入 `state/<identity>.hook.json`：
+
+```json
+{"waiting_approval": true, "ts": 1792500000.0, "event": "Notification"}
+```
+
+`health()` 會先讀這個檔，再看畫面；`waiting_approval` 為 true 時就暫緩送出。
+
+- **Claude Code**（`--settings`）：`notification_type=permission_prompt` 的 `Notification`，或 `PermissionRequest`，會設定旗標；`UserPromptSubmit`、`PostToolUse`、`Stop` 會清掉它。閒置通知不影響旗標。Hook 不輸出任何東西，所以不會替代理回答提示。對應的 `settings.json` 寫法見英文版 README。
+- **Codex CLI**（`-c notify=[...]`，或在 `config.toml` 寫 `notify = ["python3", "/path/to/runner/hooks/board_hook.py", "bob"]`）：`notify` 只回報 `agent-turn-complete`，所以在 Codex 上只能清旗標，偵測提示仍靠畫面。Codex 自己的 `hooks.json` 有權限事件，但它會套用到所有 Codex session，而且要先手動信任一次，所以 `launch.sh` 不裝。
+- **其他 CLI** 沒有 hook，只能靠畫面判斷。
+- CLI 啟動時才會讀 hook，所以已經在跑的代理要重啟後才會生效。
+- 如果 `waiting_approval: true` 沒被清掉，送出會一直暫緩（fail closed），巡檢警示會告訴你。
 - 送達是至少一次，所以預設 `BOARD_PROMPT` 會請代理忽略已處理過的 `#id`。
 
 | 變數 | 預設 | |

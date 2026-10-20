@@ -103,9 +103,32 @@ It then waits until the agent is idle, clears any leftover typed input, pastes t
 - Alerts are status only by default. Pane text is a prompt-injection channel into the coordinator, so it is opt-in: with `RUNNER_ALERT_PANE=1`, alerts quote the last few pane lines, with tokens, `key=value` secrets, long opaque strings, IPv4 addresses and e-mail addresses masked.
 - Identities listed in `RUNNER_SENSITIVE` (for example, agents that handle real data) get status-only alerts, never pane text.
 - The runner only reports and never restarts an agent. While an approval prompt matching `RUNNER_APPROVAL_RE` is on screen it types nothing (no paste, Enter or C-u) and keeps the message queued; the self-test checks this with a fake agent. A prompt the regex doesn't match is not protected.
-- Busy and approval detection only look above the agent's input box (plus the footer for busy), after removing rows that belong to the last few messages the runner pasted, so a board message that contains `(y/n)` or `esc to interrupt` can't make the agent look busy or stuck at a prompt. An approval prompt needs structure: a numbered menu (`1.` followed by `2.` or `No`) under a question, or a y/n prompt as the last line above the input. If the gate trips after a paste, the alert says there's an unsent board message on the input line.
+- Busy detection only looks above the agent's input box and in the footer, after removing rows from the last few messages the runner pasted. A y/n prompt counts only as the last line above the input box. So a board message that contains `(y/n)` or `esc to interrupt` can't make the agent look busy or stuck at a prompt. If the gate trips after a paste, the alert says there's an unsent board message on the input line.
 - Use a dedicated `RUNNER_IDENTITY` for alerts. It must not be in `APPROVERS`, `MERGERS` or `SENSITIVE_ALLOWLIST` (and set `MERGERS`, since an empty list lets anyone merge), and don't make the coordinator that reads alerts an approver or merger. Alerts count against that identity's `RATE_PER_MINUTE`.
-- Planned next step: take approval and idle state from the CLIs' own hooks (Claude Code `Notification` hook, Codex `notify`) instead of reading the screen.
+- **The gate fails closed.** The input box counts only if nothing but its wrapped current paste, a border and a short footer with no menu or prompt text sits below it. When there's no input box, for example because an approval menu replaced it and the lowest `>` is a transcript line, the message is held and nothing is typed. The menu check scans the last 15 rows of the whole screen, scrollback included. It needs a `1.` followed by `2.` or `No`, with a selection cursor or a question. Only the current unsent paste on the input line is excluded, so a message that quoted `1. Yes 2. No` can't hide a real menu. The trade-off: an agent reply that ends in a numbered list under a question can hold delivery until the screen changes. The patrol alerts you when that happens.
+
+**Hooks.** `launch.sh` installs hooks for the session it starts. They are passed on the command line, so your user config isn't touched. Set `RUNNER_HOOKS=0` to turn them off. The hooks run `runner/hooks/board_hook.py <identity>`, which writes `state/<identity>.hook.json`:
+
+```json
+{"waiting_approval": true, "ts": 1792500000.0, "event": "Notification"}
+```
+
+`health()` reads this file before looking at the screen and holds delivery while `waiting_approval` is true.
+
+- **Claude Code** (`--settings`). A `Notification` with `notification_type=permission_prompt`, or a `PermissionRequest`, sets the flag. `UserPromptSubmit`, `PostToolUse` and `Stop` clear it. Idle notifications are ignored. The hook prints nothing, so it never answers the prompt. Equivalent `settings.json`:
+  ```json
+  {"hooks": {
+    "Notification":      [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
+    "UserPromptSubmit":  [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
+    "PostToolUse":       [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
+    "Stop":              [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}]
+  }}
+  ```
+- **Codex CLI** (`-c notify=[...]`, or `notify = ["python3", "/path/to/runner/hooks/board_hook.py", "bob"]` in `config.toml`). `notify` only reports `agent-turn-complete`, so for Codex it can only clear the flag; the screen check still detects prompts. Codex's own `hooks.json` has a permission event, but it applies to every Codex session and needs a one-time trust step, so `launch.sh` doesn't install it.
+- **Other CLIs** have no hook, so the runner relies on the screen alone.
+- Hooks are read when a CLI starts, so an agent that's already running picks them up only after you restart it.
+- A stale `waiting_approval: true` keeps delivery held (fail closed), and the patrol alert tells you about it.
 - Delivery is at-least-once, so the default `BOARD_PROMPT` tells agents to ignore a `#id` they have already handled.
 
 | Variable | Default | |

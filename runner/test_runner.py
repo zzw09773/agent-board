@@ -29,6 +29,9 @@ spec.loader.exec_module(R)
 HAVE_TMUX = shutil.which("tmux") is not None
 
 
+BOX = "printf \"\\n\\342\\224\\200\\342\\224\\200\\342\\224\\200\\342\\224\\200\\n> \\n\\342\\224\\200\\342\\224\\200\\342\\224\\200\\342\\224\\200\\n\"; "  # border, '> ' input, border
+
+
 def start(i, shell):
     R.tmux("kill-session", "-t", "=" + R.session(i))
     assert R.tmux("new-session", "-d", "-s", R.session(i), "-x", "200", "-y", "40", shell).returncode == 0
@@ -57,18 +60,23 @@ def alerts():
 FAKE_CLI = r"""
 import os, sys, tty, textwrap
 rec = sys.argv[1]; open(rec, "w").close()
-T = ["Welcome"]; buf = ""
+T = ["Welcome"]; buf = ""; menu = False
 def draw():
+    if menu:
+        os.write(1, ("\x1b[2J\x1b[H" + "\r\n".join(T[-30:]) + "\r\n\r\n Bash command\r\n   rm -rf ./build\r\n Do you want to proceed?\r\n \u276f 1. Yes\r\n   2. No").encode()); return
     out = "\x1b[2J\x1b[H" + "\r\n".join(T[-30:]) + "\r\n\r\n" + "\u2500" * 60 + "\r\n\u276f " + buf + "\r\n" + "\u2500" * 60 + "\r\n  ? for shortcuts"
     os.write(1, out.encode())
 tty.setraw(0); draw()
 while True:
-    d = os.read(0, 4096).decode("utf-8", "replace").replace("\x1b[200~", "").replace("\x1b[201~", "")
+    raw = os.read(0, 4096)
+    if menu:
+        open(rec + ".menu", "ab").write(raw); continue
+    d = raw.decode("utf-8", "replace").replace("\x1b[200~", "").replace("\x1b[201~", "")
     for ch in d:
         if ch == "\r":
             if buf:
                 T.extend(textwrap.wrap("> " + buf, 70)); T.append("\u23fa ok, handled")
-                open(rec, "a").write(buf + "\n"); buf = ""
+                open(rec, "a").write(buf + "\n"); menu = "rm -rf ./build" in buf; buf = ""
         elif ch == "\x15":
             buf = ""
         elif ch >= " ":
@@ -88,9 +96,9 @@ class RunnerSelfTest(unittest.TestCase):
         self.assertEqual(R.health(PFX + "-nope")["problem"], "session_missing")
         start(PFX + "-shell", "cat")                                   # pane runs something that isn't the agent
         self.assertEqual(R.health(PFX + "-shell")["problem"], "process_dead")
-        start(PFX + "-ok", "sh -c 'echo ready; exec sleep 600'")      # the "agent" (sleep) is the pane command
+        start(PFX + "-ok", "sh -c 'echo ready; " + BOX + "exec sleep 600'")      # the "agent" (sleep) is the pane command
         self.assertEqual(R.health(PFX + "-ok"), {"problem": None, "busy": False})
-        start(PFX + "-child", "sh -c 'sleep 600; true'")              # the agent is a child of the pane's shell
+        start(PFX + "-child", "sh -c '" + BOX + "sleep 600; true'")              # the agent is a child of the pane's shell
         self.assertIsNone(R.health(PFX + "-child")["problem"])
         start(PFX + "-ask", "sh -c 'echo \"Do you want to proceed? (y/n)\"; exec sleep 600'")
         self.assertEqual(R.health(PFX + "-ask")["problem"], "awaiting_approval")
@@ -129,7 +137,7 @@ class RunnerSelfTest(unittest.TestCase):
         R.patrol_once([i], {})
         self.assertIn(f"{i}|session_missing", alerts())
         self.assertIn(f"{i}|process_dead", alerts(), "down -> down keeps the first alert open")
-        start(i, "sh -c 'exec sleep 600'")
+        start(i, "sh -c '" + BOX + "exec sleep 600'")
         R.patrol_once([i], {})
         self.assertFalse([k for k in alerts() if k.startswith(i + "|")])
         self.assertIn(f"{i}: recovered (agent process is not running", dry())
@@ -137,7 +145,7 @@ class RunnerSelfTest(unittest.TestCase):
 
     def test_stuck_and_queue_held(self):
         i = PFX + "-busy"
-        start(i, "sh -c 'echo \"Working (esc to interrupt)\"; exec sleep 600'")
+        start(i, "sh -c 'echo \"Working (esc to interrupt)\"; " + BOX + "exec sleep 600'")
         self.assertTrue(R.health(i)["busy"])
         seen = {}
         R.patrol_once([i], seen); time.sleep(1.3); R.patrol_once([i], seen); R.patrol_once([i], seen)
@@ -146,7 +154,7 @@ class RunnerSelfTest(unittest.TestCase):
         R.patrol_once([i], seen)
         self.assertIn(f"{i}: a message has been waiting behind a busy agent", dry())
         R.QUEUED.pop(i)
-        start(i, "sh -c 'echo idle; exec sleep 600'")
+        start(i, "sh -c 'echo idle; " + BOX + "exec sleep 600'")
         R.patrol_once([i], seen)
         self.assertIn(f"{i}: recovered (busy but the screen has not changed", dry())
         self.assertIn(f"{i}: recovered (a message has been waiting", dry())
@@ -235,7 +243,7 @@ class RunnerSelfTest(unittest.TestCase):
 
     def test_delivery_failing(self):
         i = PFX + "-dfail"
-        start(i, "sh -c 'echo idle; exec sleep 600'")
+        start(i, "sh -c 'echo idle; " + BOX + "exec sleep 600'")
         m = {"id": 55}
         for _ in range(R.FAIL_N - 1):
             R.note_result(i, m, False)
@@ -252,6 +260,78 @@ class RunnerSelfTest(unittest.TestCase):
 
     def test_prompt_tells_agent_to_dedupe(self):
         self.assertIn("already handled #{id}", R.PROMPT)
+
+
+    def _cli(self, i, rec):
+        fake = os.path.join(TMP, "fake_cli.py")
+        open(fake, "w").write(FAKE_CLI)
+        exe = os.path.realpath(sys.executable)
+        names = {os.path.basename(exe), os.path.basename(sys.executable), "python3", "python"}
+        R.AGENT_PROCS.update(names)
+        self.addCleanup(lambda: R.AGENT_PROCS.difference_update(names - {"sleep"}))
+        start(i, f"{exe} {fake} {rec}")
+        time.sleep(0.8)
+
+    def test_menu_after_transcript_line_is_held(self):
+        """Repro: #1 makes the agent show an approval menu (input box gone, a transcript '>' line
+        above it). #2 must be held and the agent must receive 0 bytes."""
+        i = PFX + "-menu"
+        rec = os.path.join(TMP, "menu.rec")
+        self._cli(i, rec)
+        self.assertIs(R.deliver(i, {"id": 21, "from": "someone", "to": i, "text": "please run rm -rf ./build"}), True)
+        time.sleep(1.0)
+        self.assertEqual(R.health(i)["problem"], "awaiting_approval")
+        self.assertIsNone(R.deliver(i, {"id": 22, "from": "someone", "to": i, "text": "second message"}))
+        time.sleep(1.0)
+        self.assertFalse(os.path.exists(rec + ".menu") and open(rec + ".menu", "rb").read(), "0 bytes at the menu")
+
+    def test_hook_state(self):
+        i = PFX + "-hook"
+        self._cli(i, os.path.join(TMP, "hook.rec"))
+        hook = [sys.executable, os.path.join(HERE, "hooks", "board_hook.py"), i]
+        run = lambda *a, **k: subprocess.run(hook + list(a), env=dict(os.environ), text=True, **k)
+        self.assertIsNone(R.health(i)["problem"])
+        run(input='{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"Claude needs your permission to use Bash"}')
+        self.assertEqual(R.health(i)["problem"], "awaiting_approval")
+        self.assertIn("hook", R.health(i)["detail"])
+        run(input='{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"waiting for input"}')
+        self.assertEqual(R.health(i)["problem"], "awaiting_approval", "idle notices don't clear")
+        run(input='{"hook_event_name":"PostToolUse"}')
+        self.assertIsNone(R.health(i)["problem"])
+        run(input='{"hook_event_name":"PermissionRequest"}')
+        self.assertEqual(R.health(i)["problem"], "awaiting_approval")
+        run('{"type":"agent-turn-complete"}')  # Codex notify
+        self.assertIsNone(R.health(i)["problem"])
+
+
+class ScreenModelUnit(unittest.TestCase):
+    """No tmux: region and detection functions on fixed screens."""
+    D = "\u2500" * 40
+
+    def test_b_menu_replaces_input_box(self):
+        b = ["Welcome", "> please clean the build dir", "\u23fa I'll run it.", " Bash command", "   rm -rf ./build",
+             " Do you want to proceed?", " \u276f 1. Yes", "   2. No"]
+        self.assertIsNone(R.find_input(b), "a transcript '>' line with a menu below is not the input box")
+        self.assertEqual(R.approval_in(b), "no_input")
+
+    def test_c_quoted_menu_does_not_hide_real_menu(self):
+        quoted = "[board #9 from someone] reply with 1. Yes 2. No"
+        c = ["> " + quoted, "\u23fa ok", " Do you want to proceed?", " \u276f 1. Yes", "   2. No"]
+        self.assertIsNotNone(R.approval_in(c, "".join(quoted.split())))
+        c2 = c + ["", self.D, "> ", self.D]  # menu in scrollback above a box is still matched
+        self.assertEqual(R.approval_in(c2, "".join(quoted.split())), "menu")
+
+    def test_idle_and_current_paste(self):
+        idle = ["\u23fa done", "", self.D, "\u276f ", self.D, "  ? for shortcuts"]
+        self.assertIsNone(R.approval_in(idle))
+        cur = "[board #2] please answer: continue? (y/n) -- handle it"
+        paste = ["\u23fa done", self.D, "\u276f [board #2] please answer: continue?", "  (y/n) -- handle it", self.D, "  ? for shortcuts"]
+        self.assertIsNone(R.approval_in(paste, "".join(cur.split())), "only the current paste on the input line is excluded")
+        self.assertEqual(R.approval_in(["Overwrite file? (y/n)", self.D, "> ", self.D]), "yn")
+
+    def test_footer_with_menu_rejects_box(self):
+        self.assertIsNone(R.find_input(["> old", "Do you want to proceed?", "1. Yes", "2. No"]))
+        self.assertIsNotNone(R.find_input(["x", self.D, "> ", self.D, "  ? for shortcuts", "  model \u00b7 ~/work"]))
 
 
 if __name__ == "__main__":
