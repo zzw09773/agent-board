@@ -151,7 +151,7 @@ class RunnerSelfTest(unittest.TestCase):
             "import os,sys,tty\nrec=sys.argv[1]; open(rec,'wb').close()\n"
             "print('Bash command\\n  rm -rf ./build\\nDo you want to proceed?\\n\u276f 1. Yes\\n  2. No', flush=True)\n"
             "tty.setraw(0)\nwhile True:\n    b=os.read(0,1024)\n    open(rec,'ab').write(b)\n")
-        start(i, f"exec -a sleep python3 {fake} {rec}")
+        start(i, f"bash -c 'exec -a sleep python3 {fake} {rec}'")  # exec -a is a bash builtin; /bin/sh may be dash
         time.sleep(0.8)
         self.assertEqual(R.health(i)["problem"], "awaiting_approval")
         ok = R.deliver(i, {"id": 7, "from": "someone", "to": i, "text": "please run it"})
