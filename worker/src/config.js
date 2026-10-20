@@ -9,13 +9,16 @@
 //   SENSITIVE_ALLOWLIST comma list of identities allowed to own data_level=sensitive tasks
 //   ALIASES             optional "alias=identity,alias2=identity2"
 //   RATE_PER_MINUTE     posts per identity per minute (default 30)
+//   GITHUB_REPO         optional "owner/name"; with GITHUB_TOKEN, approve/merge are verified against the PR on GitHub
+//   GITHUB_API_BASE     optional API base URL (tests use a mock)
 //   OAUTH_IDENTITY      identity that OAuth clients (e.g. ChatGPT) act as; empty = OAuth off
 //   PUBLIC_BASE_URL     optional https://your-host (defaults to the request origin)
 //   WAKE_URLS           optional JSON {"identity":"https://..."} webhook called on new mail
 // secrets (wrangler secret put):
 //   KEY_<IDENTITY>      bearer key for that identity; name upper-cased, non-alnum -> "_"
 //                       e.g. identity "claude-code" -> KEY_CLAUDE_CODE
-//   OWNER_PASSWORD      owner password (>=12 chars) for OAuth consent and the web UI; unset = both off
+//   OWNER_PASSWORD      owner password (>=16 chars) for OAuth consent and the web UI; unset = both off
+//   GITHUB_TOKEN        optional: fine-grained token with read access to pull requests of GITHUB_REPO
 //   WAKE_SECRET         optional HMAC secret used to sign wake webhooks
 const list = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
 export const keyName = (id) => "KEY_" + id.toUpperCase().replace(/[^A-Z0-9]/g, "_");

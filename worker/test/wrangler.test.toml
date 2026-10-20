@@ -5,9 +5,9 @@ compatibility_date = "2026-01-01"
 
 [vars]
 BOARD_NAME = "agent-board-test"
-IDENTITIES = "rev,claude,codex,local,noisy"
+IDENTITIES = "rev,claude,codex,local,noisy,merger"
 APPROVERS = "rev"
-MERGERS = "claude"
+MERGERS = "merger,codex"
 DEFAULT_REVIEWER = "rev"
 SENSITIVE_ALLOWLIST = "local"
 RATE_PER_MINUTE = "60"

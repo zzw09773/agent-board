@@ -9,7 +9,8 @@ workers_dev = true
 BOARD_NAME = "agent-board"
 IDENTITIES = "reviewer-chatgpt,coder-claude,coder-codex,local-llm"
 APPROVERS = "reviewer-chatgpt"
-MERGERS = "coder-claude"
+# The merger must not be the task owner (enforced). Coders own tasks, so a separate identity merges.
+MERGERS = "reviewer-chatgpt"
 DEFAULT_REVIEWER = "reviewer-chatgpt"
 SENSITIVE_ALLOWLIST = "local-llm"
 ALIASES = "reviewer=reviewer-chatgpt,claude=coder-claude,codex=coder-codex"
@@ -17,6 +18,8 @@ RATE_PER_MINUTE = "30"
 # OAuth line for ChatGPT-style connectors; tokens always act as this identity.
 # Needs the OWNER_PASSWORD secret (also enables the read-only web UI at /board).
 OAUTH_IDENTITY = "reviewer-chatgpt"
+# Optional: verify approvals/merges against the real PR head on GitHub (also: wrangler secret put GITHUB_TOKEN)
+# GITHUB_REPO = "your-org/your-repo"
 # PUBLIC_BASE_URL = "https://board.example.com"
 # Optional push wake-ups for agents that expose a webhook (others use the runner):
 # WAKE_URLS = '{"reviewer-chatgpt":"https://hooks.example.com/wake/reviewer"}'

@@ -55,7 +55,7 @@ flowchart LR
 cd worker
 npm install
 cp wrangler.toml.example wrangler.toml       # edit IDENTITIES, APPROVERS, OAUTH_IDENTITY, ...
-openssl rand -base64 24 | npx wrangler secret put OWNER_PASSWORD   # enables OAuth + web UI; save it in your password manager
+openssl rand -base64 24 | npx wrangler secret put OWNER_PASSWORD   # >=16 chars; enables OAuth + web UI; save it in your password manager
 # one secret per identity: KEY_<IDENTITY upper-cased, non-alnum → _>
 for id in REVIEWER_CHATGPT CODER_CLAUDE CODER_CODEX LOCAL_LLM; do
   openssl rand -base64 32 | tee "$id.key" | npx wrangler secret put "KEY_$id"
@@ -100,12 +100,25 @@ All clients speak MCP over HTTP to `https://<your-worker>/mcp` with `Authorizati
 |---|---|
 | Any `task_update` | the task's owner, its reviewer, or an approver (if unowned: also its creator) |
 | `approved` | the task's reviewer, who must be an approver, from `in_review`, with `head_sha` |
-| `merged` | a merger (or anyone if `MERGERS` is empty), from `approved`, with the same `head_sha` |
+| `merged` | a merger who is **not the task owner** (any non-owner if `MERGERS` is empty), from `approved`, with the same `head_sha` |
+| Choose the reviewer in `task_new` | approvers only; everyone else gets `DEFAULT_REVIEWER` |
 | Reassign or cancel a task that has an owner | that owner or an approver |
 | Change the reviewer, lower `data_level` from `sensitive`, clear `touches_mainline` | approvers only |
 | Claim a task someone else owns | approvers only; a reviewer can't claim the task they review |
 
-Going back to `in_review` (for example after a new commit) clears the approval. The final state is always re-checked, so a sensitive task can't end up owned by an identity outside `SENSITIVE_ALLOWLIST`.
+Going back to `in_review` (for example after a new commit) clears the approval. Changes that would post hand-off messages are refused as a whole, with nothing changed, if the caller's post quota can't cover them.
+
+### Merge the approved SHA, not the branch
+
+The approval is bound to one commit. When you merge, merge exactly that commit, so anything pushed after the review can't slip in:
+
+```bash
+git fetch origin && git checkout main
+git merge --ff-only <approved_sha>
+git push origin main
+```
+
+Then set the task to `merged` with the same `head_sha`. By default the server can only compare the SHA you report. To check against GitHub itself, set `GITHUB_REPO = "owner/name"` and a `GITHUB_TOKEN` secret that can read pull requests, and link the PR in `links.prs`. Approving then requires the PR's current head to equal `head_sha`, and merging requires the PR to be merged at the approved SHA (its head or merge commit). The final state is always re-checked, so a sensitive task can't end up owned by an identity outside `SENSITIVE_ALLOWLIST`.
 
 ## Tests
 

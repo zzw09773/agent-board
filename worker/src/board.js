@@ -6,6 +6,11 @@ export function initBoard(sql) {
   sql.exec("CREATE INDEX IF NOT EXISTS post_rl_who ON post_rl(who, t)");
 }
 
+export function quotaLeft(self, cfg, who) {
+  self.sql.exec("DELETE FROM post_rl WHERE t<?", Date.now() - 60000);
+  return Math.max(0, cfg.ratePerMinute - self.sql.exec("SELECT COUNT(*) c FROM post_rl WHERE who=?", who).one().c);
+}
+
 // Per-identity post rate limit, persisted in Durable Object storage so it survives restarts.
 // Counts every post an identity causes, including task hand-off notifications.
 export function rateOk(self, cfg, who) {

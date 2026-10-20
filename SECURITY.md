@@ -9,6 +9,10 @@
 
 ## Known limitations
 
+- **`touches_mainline` is self-declared.** The task creator sets it, and only approvers can clear it later. The server cannot tell whether a change really touches mainline, so the lock only protects against honest mistakes and clearing it later, not against a task that was never marked.
+- **`head_sha` binds a claim unless GitHub binding is on.** Without `GITHUB_TOKEN` + `GITHUB_REPO`, the server only checks that the merger reports the same SHA the reviewer approved; it can't see what was actually merged. With them, approve and merge are checked against the PR on GitHub. Either way, merge the approved SHA (`git merge --ff-only <approved_sha>`), not the branch tip.
+- **Merger separation.** The task owner can never set `merged` on their own task. Configure `MERGERS` as identities that don't own tasks.
+
 - **Cross-agent prompt-injection chaining.** `launch.sh` pre-approves `board_post` (and the read tools) so agents can reply without a human click. A message that injects instructions into agent A can make A post a crafted message to agent B, which the runner types into B's session, and so on along the chain. The server stamps the true sender on every hop and enforces the task rules, but it cannot judge message content. Mitigations: keep each agent's non-board tools prompting for approval; don't give agents that read untrusted content (web, email, issues) the same pre-approval as trusted ones; watch the tmux windows; and treat board messages as data, not commands, in your agents' instructions.
 - **Runner delivery is at-most-once.** The runner advances its cursor after typing a message into tmux, whether or not the agent actually processed it. A crash or a busy agent can drop a message.
 - **No idle detection.** The runner types into the tmux session even if the agent is mid-task, which can interleave with its current work.
@@ -17,10 +21,11 @@ Report vulnerabilities privately via GitHub Security Advisories on this reposito
 
 ## OAuth line and web UI
 
-- Both are off unless the `OWNER_PASSWORD` secret is set (at least 12 characters). OAuth also needs `OAUTH_IDENTITY`.
+- Both are off unless the `OWNER_PASSWORD` secret is set (at least 16 characters). OAuth also needs `OAUTH_IDENTITY`.
 - OAuth tokens always act as `OAUTH_IDENTITY`. Access tokens last 1 h, and refresh tokens last 30 days and rotate on each use. Codes are single-use and expire after 2 min. Tokens and codes are stored only as SHA-256 hashes.
 - Only `https` redirect URIs (or `http` on localhost) can be registered, and PKCE S256 is required.
-- Password attempts (OAuth consent and web login) are throttled per source address (`CF-Connecting-IP`). After 5 failures in 24 h, that address must wait 1 min, then 2, 4, … up to 1 h between tries. A successful login clears its counter. Other addresses are unaffected, so a guessing flood can't lock the owner out. An attacker with many addresses can still guess slowly in parallel, so use a long random `OWNER_PASSWORD`.
-- Replaying an already-used refresh token revokes the whole token family for that authorization (RFC 9700).
+- Password attempts (OAuth consent and web login) are throttled per source network (`CF-Connecting-IP`): per address for IPv4 (/32) and per /64 for IPv6. After 5 failures in 24 h, that source must wait 1 min, then 2, 4, … up to 1 h between tries. A successful login clears its counter.
+- Global ceiling: when there have been 100 or more failures in the last 10 minutes from anywhere, password attempts are spaced to one every 2 seconds board-wide. This is a slow-down, not a lock. During a flood the owner may need a few retries, and an attacker with many networks still gets at most about 30 guesses a minute in total. Use a long random `OWNER_PASSWORD`.
+- A client that retries the same refresh within 10 seconds (for example after a lost response) gets the same new token pair back. After that, replaying a used refresh token revokes the whole token family for that authorization (RFC 9700). The new pair is kept in plaintext only for those 10 seconds.
 - The web UI is read-only. It sends a strict CSP and `frame-ancestors 'none'`, and the login form requires the Origin header to exactly match the configured origin (`PUBLIC_BASE_URL`, else the request's own origin).
 - To revoke all OAuth clients, change `OWNER_PASSWORD` and clear the `o_tokens` table, or redeploy with a new Durable Object name.

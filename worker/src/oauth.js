@@ -3,7 +3,7 @@
 // - Consent is gated by the board owner's password (OWNER_PASSWORD secret).
 // - Every OAuth token acts as ONE configured identity (OAUTH_IDENTITY); the client can't choose.
 // Tokens and codes are stored only as SHA-256 hashes.
-const ACCESS_TTL = 3600e3, REFRESH_TTL = 30 * 86400e3, CODE_TTL = 120e3;
+const ACCESS_TTL = 3600e3, REFRESH_TTL = 30 * 86400e3, CODE_TTL = 120e3, REPLAY_GRACE = 10e3;
 export const sha = async (s) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))].map((b) => b.toString(16).padStart(2, "0")).join("");
 export const rand = (n = 32) => btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(n)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const b64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -14,29 +14,49 @@ export function initOAuth(sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS o_clients(client_id TEXT PRIMARY KEY, redirect_uris TEXT, name TEXT, created INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS o_codes(h TEXT PRIMARY KEY, client_id TEXT, redirect_uri TEXT, challenge TEXT, exp INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS o_tokens(h TEXT PRIMARY KEY, kind TEXT, client_id TEXT, exp INTEGER)");
-  try { sql.exec("ALTER TABLE o_tokens ADD COLUMN family TEXT"); } catch { /* already there */ }
+  for (const c of ["family TEXT", "used_at INTEGER", "replay TEXT"]) { try { sql.exec("ALTER TABLE o_tokens ADD COLUMN " + c); } catch { /* already there */ } }
+  sql.exec("CREATE TABLE IF NOT EXISTS auth_global(k TEXT PRIMARY KEY, v INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS auth_fail_ip(ip TEXT, t INTEGER)");
   sql.exec("CREATE INDEX IF NOT EXISTS auth_fail_ip_i ON auth_fail_ip(ip, t)");
 }
 
-// Password check with a per-source throttle (keyed by CF-Connecting-IP), so a flood of
-// bad guesses from one address can't lock the owner out everywhere.
-// Backoff: after FREE failures within 24 h, that source must wait 1 min, then 2, 4, ... capped at 1 h.
-const FREE = 5, DAY = 86400e3, MAX_WAIT = 3600e3;
-export const clientIp = (req) => req.headers.get("cf-connecting-ip") || "unknown";
+// Password check, throttled per source network: IPv4 per address (/32), IPv6 per /64
+// (one customer usually owns a whole /64, so per-address limits are trivial to dodge).
+// Per source: 5 free failures in 24 h, then 1, 2, 4 ... min between tries, capped at 1 h; success clears.
+// Global ceiling: if there were >= GLOBAL_FAILS failures in the last 10 min from anywhere, attempts are
+// spaced to one per GLOBAL_GAP ms overall. Nobody is locked out; the owner just retries a few seconds later.
+export const MIN_PASSWORD = 16;
+const FREE = 5, DAY = 86400e3, MAX_WAIT = 3600e3, GLOBAL_FAILS = 100, GLOBAL_WIN = 600e3, GLOBAL_GAP = 2000;
+export function sourceKey(ip) {
+  ip = String(ip || "").trim().toLowerCase();
+  if (!ip.includes(":")) return ip || "unknown";
+  if (ip.startsWith("::ffff:") && ip.includes(".")) return ip.slice(7); // v4-mapped
+  const [head, tail = ""] = ip.split("::");
+  const h = head ? head.split(":") : [], t = ip.includes("::") ? (tail ? tail.split(":") : []) : [];
+  const full = ip.includes("::") ? [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t] : h;
+  return full.slice(0, 4).map((x) => (parseInt(x, 16) || 0).toString(16)).join(":") + "::/64";
+}
+export const clientIp = (req) => sourceKey(req.headers.get("cf-connecting-ip") || "unknown");
 export function eq(a, b) { a = String(a); b = String(b); let r = a.length ^ b.length; for (let i = 0; i < Math.max(a.length, b.length); i++) r |= (a.charCodeAt(i) | 0) ^ (b.charCodeAt(i) | 0); return r === 0; }
-export function checkPassword(self, pw, ip) {
+export const passwordOk = (env) => !!env.OWNER_PASSWORD && String(env.OWNER_PASSWORD).length >= MIN_PASSWORD;
+export function checkPassword(self, pw, src) {
   const t = Date.now();
   self.sql.exec("DELETE FROM auth_fail_ip WHERE t<?", t - DAY);
-  const r = self.sql.exec("SELECT COUNT(*) c, MAX(t) last FROM auth_fail_ip WHERE ip=?", ip).one();
+  const r = self.sql.exec("SELECT COUNT(*) c, MAX(t) last FROM auth_fail_ip WHERE ip=?", src).one();
   if (r.c >= FREE && t < r.last + Math.min(60e3 * 2 ** (r.c - FREE), MAX_WAIT)) return "locked";
-  const ok = !!self.env.OWNER_PASSWORD && String(self.env.OWNER_PASSWORD).length >= 12 && eq(pw || "", self.env.OWNER_PASSWORD);
-  if (ok) self.sql.exec("DELETE FROM auth_fail_ip WHERE ip=?", ip);
-  else self.sql.exec("INSERT INTO auth_fail_ip VALUES(?,?)", ip, t);
+  const recent = self.sql.exec("SELECT COUNT(*) c FROM auth_fail_ip WHERE t>?", t - GLOBAL_WIN).one().c;
+  if (recent >= GLOBAL_FAILS) {
+    const last = self.sql.exec("SELECT v FROM auth_global WHERE k='last'").toArray()[0]?.v || 0;
+    if (t - last < GLOBAL_GAP) return "busy";
+    self.sql.exec("INSERT OR REPLACE INTO auth_global VALUES('last',?)", t);
+  }
+  const ok = passwordOk(self.env) && eq(pw || "", self.env.OWNER_PASSWORD);
+  if (ok) self.sql.exec("DELETE FROM auth_fail_ip WHERE ip=?", src);
+  else self.sql.exec("INSERT INTO auth_fail_ip VALUES(?,?)", src, t);
   return ok ? "ok" : "bad";
 }
 
-export const oauthEnabled = (cfg, env) => !!(cfg.oauthIdentity && env.OWNER_PASSWORD);
+export const oauthEnabled = (cfg, env) => !!(cfg.oauthIdentity && passwordOk(env));
 
 export async function oauthIdentity(self, cfg, token) {
   if (!oauthEnabled(cfg, self.env) || !token) return null;
@@ -87,7 +107,7 @@ export async function handleOAuth(self, cfg, req, base) {
     const form = (err) => page("Authorize", `<h2>${esc(cfg.boardName)}</h2><p><b>${esc(c.name)}</b> wants to use the board as <b>${esc(cfg.oauthIdentity)}</b>.</p>${err ? `<p class=e>${err}</p>` : ""}<form method=post>${hidden}<input type=password name=password placeholder="Owner password" autocomplete=current-password required autofocus><button>Allow</button></form>`);
     if (req.method !== "POST") return form("");
     const r = checkPassword(self, q.password, clientIp(req));
-    if (r !== "ok") return form(r === "locked" ? "Too many attempts; try again later." : "Wrong password.");
+    if (r !== "ok") return form(r === "locked" ? "Too many attempts from your network; try again later." : r === "busy" ? "The board is under a password-guessing flood; wait a few seconds and try again." : "Wrong password.");
     const code = rand();
     self.sql.exec("INSERT INTO o_codes VALUES(?,?,?,?,?)", await sha(code), c.client_id, q.redirect_uri, q.code_challenge, Date.now() + CODE_TTL);
     const to = new URL(q.redirect_uri); to.searchParams.set("code", code); if (q.state) to.searchParams.set("state", q.state); to.searchParams.set("iss", base);
@@ -102,7 +122,7 @@ export async function handleOAuth(self, cfg, req, base) {
       self.sql.exec("DELETE FROM o_tokens WHERE exp<?", n);
       self.sql.exec("INSERT INTO o_tokens(h,kind,client_id,exp,family) VALUES(?,?,?,?,?)", await sha(at), "access", cid, n + ACCESS_TTL, family);
       self.sql.exec("INSERT INTO o_tokens(h,kind,client_id,exp,family) VALUES(?,?,?,?,?)", await sha(rt), "refresh", cid, n + REFRESH_TTL, family);
-      return json({ access_token: at, token_type: "Bearer", expires_in: ACCESS_TTL / 1000, refresh_token: rt });
+      return { access_token: at, token_type: "Bearer", expires_in: ACCESS_TTL / 1000, refresh_token: rt };
     };
     if (f.grant_type === "authorization_code") {
       const rows = self.sql.exec("DELETE FROM o_codes WHERE h=? RETURNING *", await sha(String(f.code || ""))).toArray(); // single use
@@ -110,11 +130,15 @@ export async function handleOAuth(self, cfg, req, base) {
       if (!r || r.exp < Date.now() || r.client_id !== f.client_id || r.redirect_uri !== f.redirect_uri) return json({ error: "invalid_grant" }, 400);
       const ch = b64u(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(f.code_verifier || ""))));
       if (!eq(ch, r.challenge)) return json({ error: "invalid_grant", error_description: "PKCE mismatch" }, 400);
-      return issue(r.client_id, rand(16));
+      return json(await issue(r.client_id, rand(16)));
     }
     if (f.grant_type === "refresh_token") {
       const h = await sha(String(f.refresh_token || ""));
       const r = self.sql.exec("SELECT * FROM o_tokens WHERE h=? AND kind IN ('refresh','refresh_used')", h).toArray()[0];
+      // Grace window: a client that retries the same refresh within REPLAY_GRACE (lost response,
+      // network retry) gets the same new pair back instead of having its session revoked.
+      if (r && r.kind === "refresh_used" && r.replay && Date.now() - r.used_at < REPLAY_GRACE && (!f.client_id || f.client_id === r.client_id))
+        return json(JSON.parse(r.replay));
       if (r && r.kind === "refresh_used") {
         // Replay of an already-rotated refresh token: assume theft and revoke the whole family.
         if (r.family) self.sql.exec("DELETE FROM o_tokens WHERE family=?", r.family);
@@ -122,8 +146,11 @@ export async function handleOAuth(self, cfg, req, base) {
         return json({ error: "invalid_grant", error_description: "refresh token reuse detected; session revoked" }, 400);
       }
       if (!r || r.exp < Date.now() || (f.client_id && f.client_id !== r.client_id)) return json({ error: "invalid_grant" }, 400);
-      self.sql.exec("UPDATE o_tokens SET kind='refresh_used' WHERE h=?", h); // rotate; keep a tombstone to detect replay
-      return issue(r.client_id, r.family || rand(16));
+      const pair = await issue(r.client_id, r.family || rand(16));
+      // rotate; keep a tombstone to detect replay. The new pair is kept in plaintext only for the grace window.
+      self.sql.exec("UPDATE o_tokens SET kind='refresh_used', used_at=?, replay=? WHERE h=?", Date.now(), JSON.stringify(pair), h);
+      self.sql.exec("UPDATE o_tokens SET replay=NULL WHERE replay IS NOT NULL AND used_at<?", Date.now() - REPLAY_GRACE);
+      return json(pair);
     }
     return json({ error: "unsupported_grant_type" }, 400);
   }

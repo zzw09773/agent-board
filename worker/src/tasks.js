@@ -1,7 +1,8 @@
 // Shared task table (T-001, T-002, ...). Workflow rules are enforced server-side,
 // so no agent can skip review, self-approve, or hand sensitive work to a cloud model.
 import { canon } from "./config.js";
-import { post } from "./board.js";
+import { post, quotaLeft } from "./board.js";
+import { githubEnabled, prNumber, fetchPr } from "./github.js";
 
 export const STATUSES = ["todo", "in_progress", "in_review", "approved", "merged", "blocked", "cancelled"];
 const LOCKING = ["in_progress", "in_review"]; // states that hold the mainline lock
@@ -55,6 +56,7 @@ function check(self, cfg, t, prev, actor) {
     if (t.status === "merged") {
       if (prev.status !== "approved") throw rule(`merged can only follow approved (currently ${prev.status})`);
       if (cfg.mergers.length && !cfg.mergers.includes(actor)) throw rule(`only ${cfg.mergers.join(", ")} can merge`);
+      if (t.owner && actor === t.owner) throw rule("the task owner cannot merge their own task; a different merger must do it");
       if (!t._head_sha) throw rule("merging requires head_sha: the commit SHA being merged");
       if (!prev.approved_sha || prev.approved_sha !== t._head_sha)
         throw rule(`head_sha ${t._head_sha} does not match the approved commit ${prev.approved_sha || "(none)"}; send it back to in_review`);
@@ -110,14 +112,39 @@ function diff(a, b) {
 }
 
 // Hand-offs post a board message, which wakes the recipient.
-async function notify(self, cfg, t, prev, actor, reason) {
+function notifyTargets(t, prev, actor, reason) {
   const targets = new Map();
   if (t.next_owner && (!prev || prev.next_owner !== t.next_owner)) targets.set(t.next_owner, reason || "your turn");
   if (t.owner && prev && prev.owner !== t.owner && !targets.has(t.owner)) targets.set(t.owner, "you were assigned as owner");
   if (t.status === "in_review" && (!prev || prev.status !== "in_review") && t.reviewer) targets.set(t.reviewer, "please review");
+  targets.delete(actor);
+  return targets;
+}
+// Reject the whole call (no state change) if the actor's post quota can't cover the hand-offs.
+function ensureQuota(self, cfg, actor, targets) {
+  const left = quotaLeft(self, cfg, actor);
+  if (targets.size > left) throw rule(`rate_limited: this change needs ${targets.size} hand-off message(s) but you have ${left} left this minute; nothing was changed, retry shortly`);
+}
+// GitHub binding (only when configured): approve = PR head equals head_sha; merge = PR merged at approved_sha.
+async function githubCheck(self, t, prev) {
+  const env = self.env;
+  if (!githubEnabled(env)) return;
+  const approving = t.status === "approved" && prev && prev.status !== "approved";
+  const merging = t.status === "merged" && prev && prev.status !== "merged";
+  if (!approving && !merging) return;
+  const n = prNumber(env, t.links);
+  if (!n) throw rule(`GitHub binding is on: add links.prs with a PR URL in ${env.GITHUB_REPO}`);
+  let pr;
+  try { pr = await fetchPr(env, n); } catch (e) { throw rule(String(e.message || e) + "; nothing was changed"); }
+  if (approving && pr.head !== t.approved_sha) throw rule(`PR #${n} head is ${pr.head}, not the head_sha ${t.approved_sha} you approved; review the current head`);
+  if (merging) {
+    if (!pr.merged) throw rule(`PR #${n} is not merged on GitHub yet; merge the approved SHA first (git merge --ff-only ${prev.approved_sha})`);
+    if (pr.head !== prev.approved_sha && pr.mergeCommit !== prev.approved_sha) throw rule(`PR #${n} was merged at ${pr.head} (merge commit ${pr.mergeCommit}), not the approved ${prev.approved_sha}`);
+  }
+}
+async function notify(self, cfg, t, prev, actor, reason) {
   const sent = [];
-  for (const [to, why] of targets) {
-    if (to === actor) continue;
+  for (const [to, why] of notifyTargets(t, prev, actor, reason)) {
     const text = `[task ${t.id}] ${why}: "${t.title}"\nstatus: ${prev && prev.status !== t.status ? prev.status + " -> " : ""}${t.status} | owner: ${t.owner || "-"} | next: ${t.next_owner || "-"} | reviewer: ${t.reviewer || "-"}${t.touches_mainline ? " | mainline" : ""}${t.data_level === "sensitive" ? " | sensitive" : ""}\nupdated by ${actor}. Use task_get {"id":"${t.id}"} for details.`;
     try { const r = await post(self, cfg, actor, to, text); sent.push({ to, board_id: r.id }); } catch (e) { sent.push({ to, error: String(e.message || e) }); }
   }
@@ -166,10 +193,13 @@ export async function taskCall(self, cfg, actor, name, a) {
       if (typeof a.title !== "string" || !a.title.trim()) throw rule("title is required");
       const seq = self.sql.exec("SELECT COALESCE(MAX(seq),0) m FROM tasks").one().m + 1, n = now();
       const owner = who(cfg, a.owner, "owner");
+      const askedReviewer = who(cfg, a.reviewer, "reviewer");
+      if (askedReviewer && askedReviewer !== cfg.defaultReviewer && !cfg.approvers.includes(actor)) throw rule(`only an approver can choose the reviewer; leave it empty to use ${cfg.defaultReviewer || "the default"}`);
       const t = { id: "T-" + String(seq).padStart(3, "0"), seq, title: a.title.trim().slice(0, 120), description: String(a.description || "").slice(0, 2000), owner,
-        reviewer: who(cfg, a.reviewer, "reviewer") || cfg.defaultReviewer, status: "todo", next_owner: who(cfg, a.next_owner, "next_owner") || owner,
+        reviewer: askedReviewer || cfg.defaultReviewer, status: "todo", next_owner: who(cfg, a.next_owner, "next_owner") || owner,
         links: mergeLinks({}, a.links), touches_mainline: !!a.touches_mainline, data_level: a.data_level || "test", created_by: actor, created_at: n, updated_at: n };
       check(self, cfg, t, null, actor);
+      ensureQuota(self, cfg, actor, notifyTargets(t, null, actor, "new task for you"));
       save(self, t);
       log(self, t.id, actor, "create", { ...diff({}, t), note: a.note || undefined });
       return { ok: true, task: pub(t), woke: await notify(self, cfg, t, null, actor, "new task for you") };
@@ -202,6 +232,8 @@ export async function taskCall(self, cfg, actor, name, a) {
       const d = diff(prev, t);
       if (!Object.keys(d).length && !a.note) return { ok: true, task: pub(prev), changed: false };
       check(self, cfg, t, prev, actor);
+      ensureQuota(self, cfg, actor, notifyTargets(t, prev, actor));
+      await githubCheck(self, t, prev);
       delete t._head_sha;
       t.updated_at = now();
       save(self, t);

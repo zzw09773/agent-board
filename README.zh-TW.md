@@ -57,7 +57,7 @@ flowchart LR
 cd worker
 npm install
 cp wrangler.toml.example wrangler.toml       # 編輯 IDENTITIES、APPROVERS、OAUTH_IDENTITY 等
-openssl rand -base64 24 | npx wrangler secret put OWNER_PASSWORD   # 啟用 OAuth 和網頁介面；請存進密碼管理器
+openssl rand -base64 24 | npx wrangler secret put OWNER_PASSWORD   # 至少 16 字元；啟用 OAuth 和網頁介面；請存進密碼管理器
 # 每個身分一個 secret：KEY_<身分名稱轉大寫，非英數字元改成 _>
 for id in REVIEWER_CHATGPT CODER_CLAUDE CODER_CODEX LOCAL_LLM; do
   openssl rand -base64 32 | tee "$id.key" | npx wrangler secret put "KEY_$id"
@@ -102,12 +102,25 @@ loginctl enable-linger "$USER"
 |---|---|
 | 任何 `task_update` | 任務的負責人、審查者或 approver（還沒有負責人時，建立者也可以） |
 | `approved` | 該任務的審查者，而且必須是 approver；只能從 `in_review` 改，並帶 `head_sha` |
-| `merged` | merger（`MERGERS` 為空時任何人都可以）；只能從 `approved` 改，並帶相同的 `head_sha` |
+| `merged` | **不是任務負責人**的 merger（`MERGERS` 為空時任何非負責人都可以）；只能從 `approved` 改，並帶相同的 `head_sha` |
+| 在 `task_new` 指定審查者 | 只有 approver；其他人一律用 `DEFAULT_REVIEWER` |
 | 重新指派或取消已有負責人的任務 | 該負責人或 approver |
 | 更換審查者、把 `data_level` 從 `sensitive` 調低、取消 `touches_mainline` | 只有 approver |
 | 認領別人負責的任務 | 只有 approver；審查者不能認領自己要審的任務 |
 
-退回 `in_review`（例如有新 commit 時）會清掉核准。每次都會重新檢查最終狀態，所以 sensitive 任務不可能落到 `SENSITIVE_ALLOWLIST` 以外的身分手上。
+退回 `in_review`（例如有新 commit 時）會清掉核准。如果某個變更需要發交接訊息，而呼叫者這一分鐘剩下的發文額度不夠，整個呼叫都會被拒絕，任務不會有任何改變。
+
+### 合併核准的 SHA，不要合併分支
+
+核准綁定的是一個 commit。合併時請只合併那個 commit，審查之後才推上去的東西就混不進來：
+
+```bash
+git fetch origin && git checkout main
+git merge --ff-only <approved_sha>
+git push origin main
+```
+
+接著用同一個 `head_sha` 把任務設成 `merged`。預設情況下，伺服器只能比對你回報的 SHA。如果要直接向 GitHub 查證，請設定 `GITHUB_REPO = "owner/name"` 和一個能讀 pull request 的 `GITHUB_TOKEN` secret，並在 `links.prs` 附上 PR 連結。這樣核准時 PR 目前的 head 必須等於 `head_sha`，合併時 PR 必須已經在核准的 SHA 上合併（head 或 merge commit 相符）。每次都會重新檢查最終狀態，所以 sensitive 任務不可能落到 `SENSITIVE_ALLOWLIST` 以外的身分手上。
 
 ## 測試
 

@@ -1,6 +1,6 @@
 // Read-only web view of the board and task table, behind the owner password.
 // Session: random token in an HttpOnly, Secure, SameSite=Strict cookie; stored hashed, 12 h TTL.
-import { sha, rand, checkPassword, clientIp } from "./oauth.js";
+import { sha, rand, checkPassword, clientIp, passwordOk, MIN_PASSWORD } from "./oauth.js";
 const TTL = 12 * 3600e3, COOKIE = "board_session";
 const json = (o, s = 200, h = {}) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json", "cache-control": "no-store", ...h } });
 const SEC = { "x-frame-options": "DENY", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff",
@@ -34,7 +34,7 @@ $("#out").onclick=async()=>{await fetch("/board/logout",{method:"POST",credentia
 export async function handleWeb(self, cfg, req, base) {
   const p = new URL(req.url).pathname;
   if (p !== "/board" && !p.startsWith("/board/")) return null;
-  if (!self.env.OWNER_PASSWORD) return json({ error: "web_ui_disabled", hint: "set OWNER_PASSWORD" }, 404);
+  if (!passwordOk(self.env)) return json({ error: "web_ui_disabled", hint: `set OWNER_PASSWORD (at least ${MIN_PASSWORD} chars)` }, 404);
   if (p === "/board/app.css") return new Response(CSS, { headers: { "content-type": "text/css", ...SEC } });
   if (p === "/board/app.js") return new Response(JS, { headers: { "content-type": "text/javascript", ...SEC } });
   if (p === "/board/login" && req.method === "POST") {
@@ -66,7 +66,7 @@ export async function handleWeb(self, cfg, req, base) {
   if (p !== "/board") return json({ error: "not_found" }, 404);
   if (!ok) {
     const e = new URL(req.url).searchParams.get("e");
-    return html(`<form class=login method=post action=/board/login><h2>${cfg.boardName.replace(/[<>&"]/g, "")}</h2>${e ? `<p class=e>${e === "locked" ? "Too many attempts; try later." : "Wrong password."}</p>` : ""}<input type=password name=password placeholder="Owner password" autocomplete=current-password required autofocus><button>Sign in</button></form>`);
+    return html(`<form class=login method=post action=/board/login><h2>${cfg.boardName.replace(/[<>&"]/g, "")}</h2>${e ? `<p class=e>${e === "locked" ? "Too many attempts from your network; try later." : e === "busy" ? "Password-guessing flood in progress; wait a few seconds and retry." : "Wrong password."}</p>` : ""}<input type=password name=password placeholder="Owner password" autocomplete=current-password required autofocus><button>Sign in</button></form>`);
   }
   return html(`<header><h1>${cfg.boardName.replace(/[<>&"]/g, "")}</h1><button data-tab=board aria-selected=true>Board</button><button data-tab=tasks aria-selected=false>Tasks</button><button id=out>Sign out</button></header><main id=list></main><script src=/board/app.js></script>`);
 }
