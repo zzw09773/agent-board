@@ -122,6 +122,10 @@ git push origin main
 
 接著用同一個 `head_sha` 把任務設成 `merged`。預設情況下，伺服器只能比對你回報的 SHA。如果要直接向 GitHub 查證，請設定 `GITHUB_REPO = "owner/name"` 和一個能讀 pull request 的 `GITHUB_TOKEN` secret，並在 `links.prs` 附上 PR 連結。這樣核准時 PR 目前的 head 必須等於 `head_sha`，合併時 PR 必須已經在核准的 SHA 上合併（head 或 merge commit 相符）。每次都會重新檢查最終狀態，所以 sensitive 任務不可能落到 `SENSITIVE_ALLOWLIST` 以外的身分手上。
 
+**讓 GitHub 直接擋（建議）。** 上面的檢查只能在合併之後發現問題。若要讓 GitHub 事先擋下，再設定 `GITHUB_COMMIT_STATUS = "1"`，並給 token **Commit statuses: write**（`statuses:write`）權限。核准時，看板會在 `approved_sha` 上寫入 context 為 `agent-board/approved` 的 `success` commit status（可用 `GITHUB_STATUS_CONTEXT` 改名）。撤回核准時，退回 `in_review` 會改成 `pending`，退回 `in_progress`、`blocked`、`cancelled` 等則改成 `failure`。在主分支的 branch protection（或 ruleset）開啟 **Require status checks to pass**，並把 `agent-board/approved` 設為必要檢查。這樣 GitHub 會拒絕合併 head SHA 沒被看板核准的 PR；推了新 commit 也會重新擋住，因為新的 SHA 沒有 status。合併時的比對仍然保留，作為額外檢查。寫入 status 失敗時，呼叫仍會成功，並回報 `github_status.error`。SHA 上沒有 status，必要檢查就不會通過，所以寫入失敗只會擋下合併，不會放行。
+
+核准和合併會先等 GitHub 回應再存檔。如果這段期間任務被別人改了，呼叫會被拒絕（「task was modified during verification, please retry」），不會蓋掉較新的狀態。
+
 ## 測試
 
 ```bash
@@ -137,6 +141,8 @@ cd worker && npm install && npm test
 ## 網頁介面
 
 設定 `OWNER_PASSWORD` 之後，`https://<your-worker>/board` 會顯示留言板和任務表的唯讀畫面，需用擁有者密碼登入。Session 是 HttpOnly、Secure、SameSite=Strict 的 cookie，有效 12 小時。登入失敗會被限速。網頁上沒有任何寫入功能。
+
+登入失敗會依來源網路限速（IPv4 每個位址、IPv6 每個 /64），沒有全站鎖定。若要在邊緣防護，請在 Cloudflare WAF 為 `POST /board/login` 和 `/authorize` 加上 rate limiting 規則。
 
 ## 授權
 

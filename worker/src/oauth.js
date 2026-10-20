@@ -15,7 +15,6 @@ export function initOAuth(sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS o_codes(h TEXT PRIMARY KEY, client_id TEXT, redirect_uri TEXT, challenge TEXT, exp INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS o_tokens(h TEXT PRIMARY KEY, kind TEXT, client_id TEXT, exp INTEGER)");
   for (const c of ["family TEXT", "used_at INTEGER", "replay TEXT"]) { try { sql.exec("ALTER TABLE o_tokens ADD COLUMN " + c); } catch { /* already there */ } }
-  sql.exec("CREATE TABLE IF NOT EXISTS auth_global(k TEXT PRIMARY KEY, v INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS auth_fail_ip(ip TEXT, t INTEGER)");
   sql.exec("CREATE INDEX IF NOT EXISTS auth_fail_ip_i ON auth_fail_ip(ip, t)");
 }
@@ -23,10 +22,10 @@ export function initOAuth(sql) {
 // Password check, throttled per source network: IPv4 per address (/32), IPv6 per /64
 // (one customer usually owns a whole /64, so per-address limits are trivial to dodge).
 // Per source: 5 free failures in 24 h, then 1, 2, 4 ... min between tries, capped at 1 h; success clears.
-// Global ceiling: if there were >= GLOBAL_FAILS failures in the last 10 min from anywhere, attempts are
-// spaced to one per GLOBAL_GAP ms overall. Nobody is locked out; the owner just retries a few seconds later.
+// There is deliberately no board-wide ceiling: under a sustained distributed attack it would lock the owner
+// out too. Put Cloudflare WAF rate limiting in front of /authorize and /board/login for edge protection.
 export const MIN_PASSWORD = 16;
-const FREE = 5, DAY = 86400e3, MAX_WAIT = 3600e3, GLOBAL_FAILS = 100, GLOBAL_WIN = 600e3, GLOBAL_GAP = 2000;
+const FREE = 5, DAY = 86400e3, MAX_WAIT = 3600e3;
 export function sourceKey(ip) {
   ip = String(ip || "").trim().toLowerCase();
   if (!ip.includes(":")) return ip || "unknown";
@@ -44,12 +43,6 @@ export function checkPassword(self, pw, src) {
   self.sql.exec("DELETE FROM auth_fail_ip WHERE t<?", t - DAY);
   const r = self.sql.exec("SELECT COUNT(*) c, MAX(t) last FROM auth_fail_ip WHERE ip=?", src).one();
   if (r.c >= FREE && t < r.last + Math.min(60e3 * 2 ** (r.c - FREE), MAX_WAIT)) return "locked";
-  const recent = self.sql.exec("SELECT COUNT(*) c FROM auth_fail_ip WHERE t>?", t - GLOBAL_WIN).one().c;
-  if (recent >= GLOBAL_FAILS) {
-    const last = self.sql.exec("SELECT v FROM auth_global WHERE k='last'").toArray()[0]?.v || 0;
-    if (t - last < GLOBAL_GAP) return "busy";
-    self.sql.exec("INSERT OR REPLACE INTO auth_global VALUES('last',?)", t);
-  }
   const ok = passwordOk(self.env) && eq(pw || "", self.env.OWNER_PASSWORD);
   if (ok) self.sql.exec("DELETE FROM auth_fail_ip WHERE ip=?", src);
   else self.sql.exec("INSERT INTO auth_fail_ip VALUES(?,?)", src, t);
@@ -107,7 +100,7 @@ export async function handleOAuth(self, cfg, req, base) {
     const form = (err) => page("Authorize", `<h2>${esc(cfg.boardName)}</h2><p><b>${esc(c.name)}</b> wants to use the board as <b>${esc(cfg.oauthIdentity)}</b>.</p>${err ? `<p class=e>${err}</p>` : ""}<form method=post>${hidden}<input type=password name=password placeholder="Owner password" autocomplete=current-password required autofocus><button>Allow</button></form>`);
     if (req.method !== "POST") return form("");
     const r = checkPassword(self, q.password, clientIp(req));
-    if (r !== "ok") return form(r === "locked" ? "Too many attempts from your network; try again later." : r === "busy" ? "The board is under a password-guessing flood; wait a few seconds and try again." : "Wrong password.");
+    if (r !== "ok") return form(r === "locked" ? "Too many attempts from your network; try again later." : "Wrong password.");
     const code = rand();
     self.sql.exec("INSERT INTO o_codes VALUES(?,?,?,?,?)", await sha(code), c.client_id, q.redirect_uri, q.code_challenge, Date.now() + CODE_TTL);
     const to = new URL(q.redirect_uri); to.searchParams.set("code", code); if (q.state) to.searchParams.set("state", q.state); to.searchParams.set("iss", base);

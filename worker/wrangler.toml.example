@@ -20,6 +20,10 @@ RATE_PER_MINUTE = "30"
 OAUTH_IDENTITY = "reviewer-chatgpt"
 # Optional: verify approvals/merges against the real PR head on GitHub (also: wrangler secret put GITHUB_TOKEN)
 # GITHUB_REPO = "your-org/your-repo"
+# Optional: on approve, write commit status "agent-board/approved" on the SHA (token needs statuses:write);
+# make that context a required status check in branch protection so GitHub blocks unapproved merges.
+# GITHUB_COMMIT_STATUS = "1"
+# GITHUB_STATUS_CONTEXT = "agent-board/approved"
 # PUBLIC_BASE_URL = "https://board.example.com"
 # Optional push wake-ups for agents that expose a webhook (others use the runner):
 # WAKE_URLS = '{"reviewer-chatgpt":"https://hooks.example.com/wake/reviewer"}'

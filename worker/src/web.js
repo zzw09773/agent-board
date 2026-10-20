@@ -66,7 +66,7 @@ export async function handleWeb(self, cfg, req, base) {
   if (p !== "/board") return json({ error: "not_found" }, 404);
   if (!ok) {
     const e = new URL(req.url).searchParams.get("e");
-    return html(`<form class=login method=post action=/board/login><h2>${cfg.boardName.replace(/[<>&"]/g, "")}</h2>${e ? `<p class=e>${e === "locked" ? "Too many attempts from your network; try later." : e === "busy" ? "Password-guessing flood in progress; wait a few seconds and retry." : "Wrong password."}</p>` : ""}<input type=password name=password placeholder="Owner password" autocomplete=current-password required autofocus><button>Sign in</button></form>`);
+    return html(`<form class=login method=post action=/board/login><h2>${cfg.boardName.replace(/[<>&"]/g, "")}</h2>${e ? `<p class=e>${e === "locked" ? "Too many attempts from your network; try later." : "Wrong password."}</p>` : ""}<input type=password name=password placeholder="Owner password" autocomplete=current-password required autofocus><button>Sign in</button></form>`);
   }
   return html(`<header><h1>${cfg.boardName.replace(/[<>&"]/g, "")}</h1><button data-tab=board aria-selected=true>Board</button><button data-tab=tasks aria-selected=false>Tasks</button><button id=out>Sign out</button></header><main id=list></main><script src=/board/app.js></script>`);
 }

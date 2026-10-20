@@ -17,12 +17,22 @@ const PORT2 = PORT + 1, B2 = `http://127.0.0.1:${PORT2}`;           // second in
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Mock GitHub API: PRS[n] = { head, merged, merge_commit_sha }
 const PRS = {};
+// STATUSES[sha] = [{state, context}, ...] records commit statuses the board wrote. PRS[n].delay slows the PR lookup.
+const STATUSES = {};
 const gh = createServer((req, res) => {
+  if (req.headers.authorization !== "Bearer gh-test-token") { res.writeHead(401); return res.end("{}"); }
+  const st = req.url.match(/^\/repos\/test-org\/test-repo\/statuses\/([0-9a-f]+)$/);
+  if (st && req.method === "POST") {
+    let b = ""; req.on("data", (d) => (b += d));
+    return req.on("end", () => { const j = JSON.parse(b); (STATUSES[st[1]] ||= []).push({ state: j.state, context: j.context }); res.writeHead(201, { "content-type": "application/json" }); res.end("{}"); });
+  }
   const m = req.url.match(/^\/repos\/test-org\/test-repo\/pulls\/(\d+)$/);
   const pr = m && PRS[m[1]];
-  if (!pr || req.headers.authorization !== "Bearer gh-test-token") { res.writeHead(404); return res.end("{}"); }
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ head: { sha: pr.head }, merged: pr.merged, merge_commit_sha: pr.merge_commit_sha || null }));
+  if (!pr) { res.writeHead(404); return res.end("{}"); }
+  setTimeout(() => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ head: { sha: pr.head }, merged: pr.merged, merge_commit_sha: pr.merge_commit_sha || null }));
+  }, pr.delay || 0);
 });
 const PW = "test-owner-password-123";
 const KEY = Object.fromEntries(["rev", "claude", "codex", "local", "noisy", "merger"].map((n) => [n, `test-key-${n}-${randomBytes(12).toString("hex")}`]));
@@ -47,7 +57,7 @@ before(async () => {
   writeFileSync(env1, keys + `\nOWNER_PASSWORD=${PW}\n`);
   writeFileSync(env2, keys + `\nOWNER_PASSWORD=${PW}\nGITHUB_TOKEN=gh-test-token\n`);
   dev = start(PORT, env1, [], "__log");
-  dev2 = start(PORT2, env2, ["--var", "GITHUB_REPO:test-org/test-repo", "--var", `GITHUB_API_BASE:http://127.0.0.1:${gh.address().port}`], "__log2");
+  dev2 = start(PORT2, env2, ["--var", "GITHUB_REPO:test-org/test-repo", "--var", "GITHUB_COMMIT_STATUS:1", "--var", `GITHUB_API_BASE:http://127.0.0.1:${gh.address().port}`], "__log2");
   await ready(B, "__log"); await ready(B2, "__log2");
 });
 after(() => { if (process.env.SHOWLOG) console.log(globalThis.__log, globalThis.__log2); for (const p of [dev, dev2]) { try { process.kill(-p.pid); } catch {} } gh.close(); rmSync(tmp, { recursive: true, force: true }); });
@@ -273,14 +283,41 @@ test("bypass: GitHub binding refuses a merge of anything but the approved SHA", 
   ok(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }, B2));
 });
 
-test("global password ceiling slows a distributed flood without locking the owner out", async () => {
+test("no board-wide lockout: a distributed flood does not slow the owner down", async () => {
   const lg = (pw, ip) => fetch(B2 + "/board/login", { method: "POST", redirect: "manual", body: new URLSearchParams({ password: pw }), headers: { origin: B2, "cf-connecting-ip": ip } });
-  for (let i = 0; i < 100; i++) await lg("wrong-password-x", `198.18.${i >> 8}.${i & 255}`);
-  const first = (await lg("wrong-password-x", "198.19.0.1")).headers.get("location");
-  const owner = (await lg(PW, "198.19.0.2")).headers.get("location");
-  assert.match(first + " " + owner, /e=busy/, "attempts are spaced during a flood");
-  await sleep(2100);
-  assert.equal((await lg(PW, "198.19.0.3")).headers.get("location"), "/board", "owner gets in after a short wait");
+  for (let i = 0; i < 120; i++) await lg("wrong-password-x", `198.18.${i >> 8}.${i & 255}`);
+  assert.equal((await lg(PW, "198.19.0.2")).headers.get("location"), "/board", "owner gets in immediately");
+  for (let i = 0; i < 5; i++) await lg("wrong-password-x", "198.19.0.9");
+  assert.match((await lg(PW, "198.19.0.9")).headers.get("location"), /e=locked/, "per-source backoff still applies");
+});
+
+test("bypass: race - approve in flight while the owner sends the task back (slow GitHub)", async () => {
+  const id = await ghTask(11);
+  const SR = "f".repeat(40); PRS[11] = { head: SR, merged: false, delay: 1500 };
+  const approving = call("rev", "task_update", { id, status: "approved", head_sha: SR }, B2);
+  await sleep(400);
+  ok(await call("claude", "task_update", { id, status: "in_progress", note: "found a bug" }, B2));
+  no(await approving, /modified during verification, please retry/);
+  const g = await call("rev", "task_get", { id }, B2);
+  assert.equal(g.task.status, "in_progress");
+  assert.equal(g.task.approved_sha, null);
+  const statuses = g.history.map((h) => h.detail.status).filter(Boolean).map((x) => x[1]);
+  assert.deepEqual(statuses.reverse(), ["todo", "in_progress", "in_review", "in_progress"], "history has no approval");
+  assert.equal(STATUSES[SR], undefined, "no success status was written for the rejected approval");
+});
+
+test("GitHub commit status: approve writes success, withdrawing writes pending/failure", async () => {
+  const S3 = "d".repeat(40), S4 = "e".repeat(40);
+  const id = await ghTask(12); PRS[12] = { head: S3, merged: false };
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S3 }, B2));
+  assert.deepEqual(STATUSES[S3], [{ state: "success", context: "agent-board/approved" }]);
+  ok(await call("claude", "task_update", { id, status: "in_review" }, B2));
+  assert.deepEqual(STATUSES[S3].at(-1), { state: "pending", context: "agent-board/approved" });
+  PRS[12] = { head: S4, merged: false };
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S4 }, B2));
+  assert.deepEqual(STATUSES[S4], [{ state: "success", context: "agent-board/approved" }]);
+  ok(await call("claude", "task_update", { id, status: "in_progress" }, B2));
+  assert.deepEqual(STATUSES[S4].at(-1), { state: "failure", context: "agent-board/approved" });
 });
 
 test("unit: source keys are /32 for IPv4 and /64 for IPv6; password minimum is 16", async () => {

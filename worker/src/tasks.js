@@ -2,7 +2,7 @@
 // so no agent can skip review, self-approve, or hand sensitive work to a cloud model.
 import { canon } from "./config.js";
 import { post, quotaLeft } from "./board.js";
-import { githubEnabled, prNumber, fetchPr } from "./github.js";
+import { githubEnabled, prNumber, fetchPr, statusEnabled, setStatus } from "./github.js";
 
 export const STATUSES = ["todo", "in_progress", "in_review", "approved", "merged", "blocked", "cancelled"];
 const LOCKING = ["in_progress", "in_review"]; // states that hold the mainline lock
@@ -131,7 +131,7 @@ async function githubCheck(self, t, prev) {
   if (!githubEnabled(env)) return;
   const approving = t.status === "approved" && prev && prev.status !== "approved";
   const merging = t.status === "merged" && prev && prev.status !== "merged";
-  if (!approving && !merging) return;
+  if (!approving && !merging) return false;
   const n = prNumber(env, t.links);
   if (!n) throw rule(`GitHub binding is on: add links.prs with a PR URL in ${env.GITHUB_REPO}`);
   let pr;
@@ -140,7 +140,18 @@ async function githubCheck(self, t, prev) {
   if (merging) {
     if (!pr.merged) throw rule(`PR #${n} is not merged on GitHub yet; merge the approved SHA first (git merge --ff-only ${prev.approved_sha})`);
     if (pr.head !== prev.approved_sha && pr.mergeCommit !== prev.approved_sha) throw rule(`PR #${n} was merged at ${pr.head} (merge commit ${pr.mergeCommit}), not the approved ${prev.approved_sha}`);
-  }
+  }  return true;
+}
+// Commit status on GitHub (only with GITHUB_COMMIT_STATUS=1), written after the board state is saved.
+// A failed write never leaves a stale "success": the worst case is a missing status, which a required check blocks.
+async function publishStatus(self, t, prev) {
+  const env = self.env;
+  if (!statusEnabled(env)) return null;
+  let sha, state, desc;
+  if (t.approved_sha && t.approved_sha !== prev.approved_sha) { sha = t.approved_sha; state = "success"; desc = `${t.id} approved by the reviewer on agent-board`; }
+  else if (prev.approved_sha && !t.approved_sha && t.status !== "merged") { sha = prev.approved_sha; state = t.status === "in_review" ? "pending" : "failure"; desc = `${t.id} approval withdrawn (now ${t.status})`; }
+  else return null;
+  try { await setStatus(env, sha, state, desc); return { sha, state }; } catch (e) { return { sha, state, error: String(e.message || e) }; }
 }
 async function notify(self, cfg, t, prev, actor, reason) {
   const sent = [];
@@ -233,12 +244,19 @@ export async function taskCall(self, cfg, actor, name, a) {
       if (!Object.keys(d).length && !a.note) return { ok: true, task: pub(prev), changed: false };
       check(self, cfg, t, prev, actor);
       ensureQuota(self, cfg, actor, notifyTargets(t, prev, actor));
-      await githubCheck(self, t, prev);
+      if (await githubCheck(self, t, prev)) {
+        // githubCheck awaited the network, so other calls may have run meanwhile. Optimistic concurrency:
+        // if the stored task is no longer exactly what we validated against, refuse instead of overwriting it.
+        // Nothing awaits between this re-read and save(), so the compare-and-write is atomic in the Durable Object.
+        if (JSON.stringify(get(self, prev.id)) !== JSON.stringify(prev)) throw rule("task was modified during verification, please retry; nothing was changed");
+        ensureQuota(self, cfg, actor, notifyTargets(t, prev, actor));
+      }
       delete t._head_sha;
       t.updated_at = now();
       save(self, t);
       log(self, t.id, actor, name === "task_claim" ? "claim" : "update", { ...d, note: a.note || undefined });
-      return { ok: true, task: pub(t), changes: d, woke: await notify(self, cfg, t, prev, actor) };
+      const github_status = await publishStatus(self, t, prev);
+      return { ok: true, task: pub(t), changes: d, ...(github_status ? { github_status } : {}), woke: await notify(self, cfg, t, prev, actor) };
     }
   } catch (e) {
     if (e instanceof RuleError) return { ok: false, error: e.message };

@@ -120,6 +120,10 @@ git push origin main
 
 Then set the task to `merged` with the same `head_sha`. By default the server can only compare the SHA you report. To check against GitHub itself, set `GITHUB_REPO = "owner/name"` and a `GITHUB_TOKEN` secret that can read pull requests, and link the PR in `links.prs`. Approving then requires the PR's current head to equal `head_sha`, and merging requires the PR to be merged at the approved SHA (its head or merge commit). The final state is always re-checked, so a sensitive task can't end up owned by an identity outside `SENSITIVE_ALLOWLIST`.
 
+**Let GitHub enforce it (recommended).** Those checks only detect a bad merge after the fact. To have GitHub block it, also set `GITHUB_COMMIT_STATUS = "1"` and give the token **Commit statuses: write** (`statuses:write`). On approve, the board writes a `success` commit status with context `agent-board/approved` (override with `GITHUB_STATUS_CONTEXT`) on `approved_sha`. If the approval is withdrawn, it sets that status to `pending` (back to `in_review`) or `failure` (back to `in_progress`, `blocked`, `cancelled`, …). In the repo's branch protection (or ruleset) for the main branch, enable **Require status checks to pass** and add `agent-board/approved` as a required check. GitHub then refuses to merge any PR whose head SHA the board hasn't approved, and a new push resets it because the new SHA has no status. The merge-time comparison stays on as an extra check. If writing the status fails, the call still succeeds and reports `github_status.error`. With no status on the SHA, the required check stays unmet, so a failure blocks the merge instead of allowing it.
+
+Approve and merge wait on GitHub before saving. If the task changed meanwhile, the call is rejected with "task was modified during verification, please retry" instead of overwriting the newer state.
+
 ## Tests
 
 ```bash
@@ -134,7 +138,7 @@ A changed tool is "live" only after **every** client type has actually called it
 
 ## Web UI
 
-When `OWNER_PASSWORD` is set, `https://<your-worker>/board` shows a read-only view of the board and the task table, behind the owner password. Sessions are HttpOnly, Secure and SameSite=Strict cookies that last 12 h. Failed logins are throttled. There is no write access from the web.
+When `OWNER_PASSWORD` is set, `https://<your-worker>/board` shows a read-only view of the board and the task table, behind the owner password. Sessions are HttpOnly, Secure and SameSite=Strict cookies that last 12 h. Failed logins are throttled per source network (IPv4 address, IPv6 /64); there is no board-wide lockout. For edge protection, add a Cloudflare WAF rate limiting rule on `POST /board/login` and `/authorize`. There is no write access from the web.
 
 ## License
 
