@@ -33,7 +33,7 @@ flowchart LR
   ChatGPT["ChatGPT（自訂 MCP 連接器）"] -- OAuth 2.1 + PKCE --> A
   Browser["擁有者的瀏覽器"] -- 密碼登入 session --> UI[/board 唯讀介面/] --> DO
   subgraph Host["你的工作站／伺服器"]
-    R[runner.py\n每個身分一個 board_wait 迴圈] -- tmux send-keys --> T1[tmux board-coder-claude\nClaude Code]
+    R[runner.py\n每個身分一個 board_wait 迴圈\n＋健康巡檢] -- tmux 貼上並確認 --> T1[tmux board-coder-claude\nClaude Code]
     R --> T2[tmux board-coder-codex\nCodex CLI]
     R --> T3[tmux board-local-llm\nClaude Code → LiteLLM → vLLM]
   end
@@ -81,6 +81,42 @@ loginctl enable-linger "$USER"
 ```
 
 先自己把每個代理的 session 開一次（這樣才有 session ID），把 ID 填進 `identities.tsv`，之後交給 runner 接續。紀錄檔在 `runner/logs/<identity>.log`。
+
+### Runner 健康檢查與巡檢
+
+**確認送達。** 輸入訊息前，runner 會先做健康檢查：
+- tmux session `board-<identity>` 必須存在（完全比對，`tmux has-session -t =name`）；
+- 代理行程必須還活著，也就是 pane 的指令或它的直接子行程名稱在 `RUNNER_AGENT_PROCS` 裡。
+
+接著等代理閒下來，清掉殘留的輸入，貼上訊息，並確認 Enter 有被接受。任何一步失敗，留言板的游標都不會前進，訊息稍後會再送。
+
+**巡檢。** 巡檢執行緒每 `RUNNER_PATROL_SEC` 秒檢查每個身分，並以該身分在留言板上通知 `RUNNER_COORDINATOR`：
+
+| 問題 | 意思 |
+|---|---|
+| `session_missing` | tmux session 不見了 |
+| `process_dead` | pane 裡跑的不是代理 |
+| `awaiting_approval` | 代理停在確認提示 |
+| `stuck` | 代理忙碌中，但畫面超過 `RUNNER_STUCK_SEC`（預設 15 分鐘）沒變 |
+| `queue_held` | 訊息排在忙碌的代理後面超過 `RUNNER_QUEUE_SEC`（預設 10 分鐘） |
+
+- 每個問題只通知一次，恢復時會再通知一次。尚未解除的警示存在 `state/alerts.json`，所以重啟 runner 不會重複通知。
+- 警示會附上 pane 最後幾行，但 token、`key=value` 形式的秘密、長串不透明字串、IPv4 位址和 e-mail 都會被遮蔽。
+- 列在 `RUNNER_SENSITIVE` 的身分（例如處理真實資料的代理）只會收到狀態，絕不附 pane 內容。
+- Runner 只回報，不會重啟代理，也不會替它回答提示。
+
+| 變數 | 預設 | |
+|---|---|---|
+| `RUNNER_COORDINATOR` | （未設定：警示寫到 `logs/alerts.log`） | 接收警示的身分 |
+| `RUNNER_SENSITIVE` | （無） | 逗號分隔；只送狀態 |
+| `RUNNER_AGENT_PROCS` | `claude,codex,gemini,node` | 算作代理的行程名稱 |
+| `RUNNER_PATROL_SEC` / `RUNNER_STUCK_SEC` / `RUNNER_QUEUE_SEC` | 240 / 900 / 600 | 秒數 |
+| `RUNNER_DRY=1` | | 警示寫到 `logs/alerts-dry.log`，不發到留言板 |
+| `RUNNER_STATE` | `runner/state` | 游標檔和 `alerts.json` |
+| `RUNNER_PATROL_ONLY=1` | | 只巡檢、不送訊息（例如搭配另一個 runner） |
+| `RUNNER_BUSY_RE` / `RUNNER_APPROVAL_RE` | 內建 | 「忙碌」和「確認提示」的正規表示式，CLI 畫面不同時可覆寫 |
+
+自我測試：`python3 runner/test_runner.py`。它在私有的 tmux socket 上開臨時 session，所以不會碰到你真正的 session，並使用 `RUNNER_DRY=1`。測試涵蓋各種健康狀態、遮蔽、敏感身分、去重與恢復通知、卡住與排隊警示，以及 session 不見時暫緩送出訊息。沒有安裝 tmux 時會自動略過。
 
 ## 連接代理
 

@@ -1,20 +1,45 @@
 #!/usr/bin/env python3
-"""board-runner: wakes local CLI agents when the board has mail for them.
+"""board-runner: wakes local CLI agents when the board has mail for them, and patrols their health.
 
 One long-poll thread per identity calls board_wait on the board's /mcp endpoint
-with that identity's own key. When a message arrives, it is typed into the
+with that identity's own key. When a message arrives, it is pasted into the
 identity's tmux session (board-<identity>), which runs the agent CLI resumed on a
 fixed session via launch.sh. Attach with: tmux attach -t board-<identity>
 
+Delivery is verified: before typing, the runner checks the session is healthy (health()),
+waits until the agent is idle, clears leftover input, pastes, and confirms the Enter was
+taken. If anything fails, the board cursor is NOT advanced, so the message is retried.
+
+A patrol thread checks every identity every RUNNER_PATROL_SEC and alerts the coordinator
+on the board (once per problem, plus a recovery note): session gone, agent process dead,
+stopped at an approval prompt, busy with no screen change for RUNNER_STUCK_SEC, or a
+message queued behind a busy agent for RUNNER_QUEUE_SEC. The runner only reports; it never
+restarts agents or answers prompts for them.
+
 Config (env or .env next to this file):
-  BOARD_URL        https://<your-worker>/mcp
-  BOARD_CONFIG_DIR directory holding identities.tsv and <identity>.key files
-  BOARD_IDS        optional comma list to run only some identities
+  BOARD_URL            https://<your-worker>/mcp
+  BOARD_CONFIG_DIR     directory holding identities.tsv and <identity>.key files
+  BOARD_IDS            optional comma list to run only some identities
+  RUNNER_COORDINATOR   identity that receives patrol alerts (unset = alerts only go to the logs)
+  RUNNER_SENSITIVE     comma list of identities whose alerts carry status only, never pane text
+                       (e.g. agents that handle sensitive data)
+  RUNNER_AGENT_PROCS   comma list of process names that count as "the agent is alive"
+                       (pane command or a direct child of the pane); default claude,codex,gemini,node
+  RUNNER_DRY=1         alerts are written to logs/alerts-dry.log instead of the board
+  RUNNER_STATE         state dir (cursor files, alerts.json); default ./state
+  RUNNER_PATROL_SEC    patrol interval, default 240
+  RUNNER_STUCK_SEC     busy with an unchanged screen this long = stuck, default 900
+  RUNNER_QUEUE_SEC     message waiting behind a busy agent this long = alert, default 600
+  RUNNER_PATROL_ONLY=1 run only the patrol (no delivery threads)
+  RUNNER_TMUX_SOCKET   optional tmux -L socket name (the self-test uses its own)
 """
 import datetime
+import hashlib
 import json
 import os
+import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -32,15 +57,38 @@ def load_env(path):
 
 
 load_env(os.path.join(HERE, ".env"))
-URL = os.environ.get("BOARD_URL", "")
-CONF = os.path.expanduser(os.environ.get("BOARD_CONFIG_DIR", "~/.config/agent-board"))
-LOGS = os.path.join(HERE, "logs")
-STATE = os.path.join(HERE, "state")
-PROMPT = os.environ.get(
+env = os.environ.get
+csv = lambda s: [x.strip() for x in str(s or "").split(",") if x.strip()]
+URL = env("BOARD_URL", "")
+CONF = os.path.expanduser(env("BOARD_CONFIG_DIR", "~/.config/agent-board"))
+LOGS = env("RUNNER_LOGS", os.path.join(HERE, "logs"))
+STATE = env("RUNNER_STATE", os.path.join(HERE, "state"))
+DRY = env("RUNNER_DRY") == "1"
+COORDINATOR = env("RUNNER_COORDINATOR", "")
+SENSITIVE = set(csv(env("RUNNER_SENSITIVE")))
+AGENT_PROCS = set(csv(env("RUNNER_AGENT_PROCS", "claude,codex,gemini,node")))
+PATROL_SEC = int(env("RUNNER_PATROL_SEC", "240"))
+STUCK_SEC = int(env("RUNNER_STUCK_SEC", "900"))
+QUEUE_SEC = int(env("RUNNER_QUEUE_SEC", "600"))
+PROMPT = env(
     "BOARD_PROMPT",
     '[board #{id} from {frm} to {to}] {text} -- Handle this, then reply with the board tool '
     'board_post to="{frm}" (start with "Re #{id}"). Never paste secrets or sensitive data on the board.',
 )
+# Screen patterns of common agent CLIs. Override with RUNNER_BUSY_RE / RUNNER_APPROVAL_RE if yours differ.
+BUSY = re.compile(env("RUNNER_BUSY_RE", r"esc to interrupt|esc to cancel|• Working|Working \(|Thinking…|✻ \w+ing…|\(esc to"))
+APPROVAL = re.compile(env("RUNNER_APPROVAL_RE",
+    r"Do you want to (?:proceed|make this edit|create|run)|Allow (?:command|this)|Would you like to (?:run|make|apply)"
+    r"|❯ 1\. Yes|Yes, (?:proceed|and don't ask)|Press enter to confirm|approve this|\(y/n\)|\[y/N\]"), re.I)
+INPUT = re.compile(r"^\s*(?:│\s*)?[›❯>]\s?(.*)$")  # the agent's input line
+# Masking for pane text quoted in alerts: tokens, key=value secrets, long opaque strings, IPv4, e-mail.
+SECRET = re.compile(r"(?:sk|pk|ghp|gho|ghs|github_pat|xox[abp]|AKIA)[-_A-Za-z0-9]{12,}|Bearer\s+\S+"
+                    r"|(?:key|token|secret|password|passwd)\s*[=:]\s*\S+|\b[A-Za-z0-9+/_-]{32,}\b"
+                    r"|\b(?:\d{1,3}\.){3}\d{1,3}\b|\S+@\S+", re.I)
+NAMES = {"session_missing": "tmux session is gone", "process_dead": "agent process is not running",
+         "awaiting_approval": "stopped at an approval prompt", "stuck": "busy but the screen has not changed",
+         "queue_held": "a message has been waiting behind a busy agent"}
+DOWN = ("session_missing", "process_dead")
 
 
 def identities():
@@ -53,8 +101,13 @@ def identities():
 
 
 def log(i, m):
+    os.makedirs(LOGS, exist_ok=True)
     with open(os.path.join(LOGS, f"{i}.log"), "a") as f:
         f.write(f"{datetime.datetime.now():%m-%d %H:%M:%S} {m}\n")
+
+
+def key_of(i):
+    return open(os.path.join(CONF, f"{i}.key")).read().strip()
 
 
 def rpc(key, name, args, timeout=70):
@@ -62,51 +115,319 @@ def rpc(key, name, args, timeout=70):
                        "params": {"name": name, "arguments": args}}).encode()
     req = urllib.request.Request(URL, body, {"Authorization": "Bearer " + key,
                                              "content-type": "application/json",
-                                             "User-Agent": "agent-board-runner/0.1"})
+                                             "User-Agent": "agent-board-runner/0.2"})
     d = json.load(urllib.request.urlopen(req, timeout=timeout))
     if "error" in d:
         raise RuntimeError(d["error"])
     return d["result"]["structuredContent"]
 
 
+TMUX = ["tmux"] + (["-L", env("RUNNER_TMUX_SOCKET")] if env("RUNNER_TMUX_SOCKET") else [])
+
+
 def tmux(*a):
-    return subprocess.run(["tmux", *a], capture_output=True, text=True)
+    return subprocess.run([*TMUX, *a], capture_output=True, text=True)
+
+
+def session(i):
+    return "board-" + i
 
 
 def ensure(i):
-    s = "board-" + i
-    if tmux("has-session", "-t", s).returncode != 0:
+    s = session(i)
+    if tmux("has-session", "-t", "=" + s).returncode != 0:
         tmux("new-session", "-d", "-s", s, "-x", "220", "-y", "50",
              f"{HERE}/launch.sh {i}; echo '[exited] press Enter'; read")
         log(i, "started tmux " + s)
-        time.sleep(int(os.environ.get("BOARD_START_WAIT", "25")))
+        time.sleep(int(env("BOARD_START_WAIT", "25")))
     return s
 
 
+# ---------- screen helpers ----------
+def cap(s):
+    r = tmux("capture-pane", "-p", "-J", "-t", "=" + s + ":")
+    return r.stdout if r.returncode == 0 else None
+
+
+def tail(s, n):
+    """Last n lines of the pane, ignoring the blank rows below the cursor."""
+    lines = (cap(s) or "").rstrip().splitlines()
+    return "\n".join(lines[-n:])
+
+
+def busy(s):
+    return bool(BUSY.search(tail(s, 12)))
+
+
+def inputline(s):
+    c = cap(s)
+    if c is None:
+        return None
+    for x in reversed(c.splitlines()[-15:]):
+        m = INPUT.match(x)
+        if m:
+            return m.group(1).strip()
+    return "".join("".join([x for x in c.splitlines() if x.strip()][-4:]).split())
+
+
+def typed(s):
+    """Real text before the cursor on the input line (ghost suggestions sit after the cursor)."""
+    r = tmux("display", "-p", "-t", "=" + s + ":", "#{cursor_x} #{cursor_y}")
+    if r.returncode:
+        return ""
+    x, y = map(int, r.stdout.split())
+    lines = (cap(s) or "").splitlines()
+    if y >= len(lines):
+        return ""
+    m = INPUT.match(lines[y][:x])
+    return m.group(1).strip() if m else ""
+
+
+# ---------- health ----------
+def children(pid):
+    r = subprocess.run(["ps", "--ppid", str(pid), "-o", "comm="], capture_output=True, text=True)
+    return r.stdout.split()
+
+
+def health(i):
+    """{"problem": None|"session_missing"|"process_dead"|"awaiting_approval", "detail": str, "busy": bool}"""
+    s = session(i)
+    if tmux("has-session", "-t", "=" + s).returncode:
+        return {"problem": "session_missing", "detail": f"no tmux session {s}"}
+    r = tmux("display", "-p", "-t", "=" + s + ":", "#{pane_current_command}\t#{pane_pid}\t#{pane_dead}")
+    if r.returncode or not r.stdout.strip():
+        return {"problem": "session_missing", "detail": f"no tmux session {s}"}
+    cmd, pid, dead = (r.stdout.strip().split("\t") + ["", "", ""])[:3]
+    kids = children(pid) if pid.isdigit() else []
+    if dead == "1" or not (cmd in AGENT_PROCS or AGENT_PROCS.intersection(kids)):
+        return {"problem": "process_dead", "detail": f"pane is running {cmd or '?'}, no agent process"}
+    if APPROVAL.search(tail(s, 25)):
+        return {"problem": "awaiting_approval", "detail": "waiting at a confirmation prompt"}
+    return {"problem": None, "busy": busy(s)}
+
+
+# ---------- alerts (deduped in STATE/alerts.json, with a recovery note) ----------
+_lock = threading.Lock()
+QUEUED = {}  # identity -> time a message started waiting behind a busy agent
+
+
+def _alerts():
+    try:
+        return json.load(open(os.path.join(STATE, "alerts.json")))
+    except Exception:
+        return {}
+
+
+def _save(a):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = os.path.join(STATE, "alerts.json.tmp")
+    json.dump(a, open(tmp, "w"))
+    os.replace(tmp, os.path.join(STATE, "alerts.json"))
+
+
+def lastlines(i, n=6):
+    """Last pane lines for an alert, masked. Sensitive identities never send pane text."""
+    if i in SENSITIVE:
+        return ""
+    lines = [x.rstrip() for x in (cap(session(i)) or "").splitlines() if x.strip()][-n:]
+    return "\n".join(SECRET.sub("[masked]", x)[:160] for x in lines)
+
+
+def post(i, text):
+    if DRY or not COORDINATOR:
+        os.makedirs(LOGS, exist_ok=True)
+        with open(os.path.join(LOGS, "alerts-dry.log" if DRY else "alerts.log"), "a") as f:
+            f.write(f"{datetime.datetime.now():%m-%d %H:%M:%S} [{i}] {text}\n")
+        return
+    rpc(key_of(i), "board_post", {"to": COORDINATOR, "text": text}, timeout=30)  # posted as the affected identity
+
+
+def alert(i, prob, st=None):
+    with _lock:
+        a = _alerts()
+        k = f"{i}|{prob}"
+        if k in a:
+            return False
+        a[k] = time.time()
+        _save(a)
+    st = st or {}
+    t = f"[runner patrol] {i}: {NAMES.get(prob, prob)}" + (f" ({st['detail']})" if st.get("detail") else "")
+    if prob in ("stuck", "queue_held"):
+        t += f", for about {int(st.get('dur', 0) // 60)} min"
+    if i in SENSITIVE:
+        t += ". Status only: no screen text is sent for this identity."
+    elif prob != "session_missing":
+        ll = lastlines(i)
+        if ll:
+            t += "\nLast lines:\n" + ll
+    t += "\n(The runner only reports; it does not restart or type for the agent. You will get a note when it recovers.)"
+    try:
+        post(i, t)
+        log(i, f"alert posted: {prob}")
+    except Exception as e:
+        log(i, f"error alert post {prob}: {e!r}")
+    return True
+
+
+def resolve(i, prob):
+    with _lock:
+        a = _alerts()
+        k = f"{i}|{prob}"
+        if k not in a:
+            return False
+        t0 = a.pop(k)
+        _save(a)
+    try:
+        post(i, f"[runner patrol] {i}: recovered ({NAMES.get(prob, prob)}, after about {int((time.time() - t0) // 60)} min)")
+        log(i, f"recovery posted: {prob}")
+    except Exception as e:
+        log(i, f"error recovery post {prob}: {e!r}")
+    return True
+
+
+def patrol_once(ids, seen):
+    """One patrol pass. seen: identity -> (screen hash, since) carried between passes."""
+    for i in ids:
+        try:
+            st = health(i)
+            p = st["problem"]
+            for q in DOWN + ("awaiting_approval",):
+                if q != p and not (p in DOWN and q in DOWN):
+                    resolve(i, q)
+            if p is None or p == "awaiting_approval":
+                for q in DOWN:
+                    resolve(i, q)
+            if p:
+                alert(i, p, st)
+                seen.pop(i, None)
+            stuck = False
+            if p is None and st.get("busy"):
+                h = hashlib.sha256((cap(session(i)) or "").encode()).hexdigest()
+                o = seen.get(i)
+                if not o or o[0] != h:
+                    seen[i] = (h, time.time())
+                elif time.time() - o[1] > STUCK_SEC:
+                    stuck = True
+                    alert(i, "stuck", {"dur": time.time() - o[1]})
+            else:
+                seen.pop(i, None)
+            if not stuck:
+                resolve(i, "stuck")
+            qt = QUEUED.get(i)
+            if qt and time.time() - qt > QUEUE_SEC:
+                alert(i, "queue_held", {"dur": time.time() - qt})
+            elif not qt:
+                resolve(i, "queue_held")
+        except Exception as e:
+            log(i, f"error patrol {e!r}")
+
+
+def patrol(ids):
+    seen = {}
+    while True:
+        patrol_once(ids, seen)
+        time.sleep(PATROL_SEC)
+
+
+# ---------- delivery ----------
+def wait_idle(i, s, limit=3600):
+    t0 = time.time()
+    warned = False
+    try:
+        while True:
+            if not busy(s):
+                time.sleep(2)
+                if not busy(s):
+                    return True
+            QUEUED.setdefault(i, t0)
+            if not warned and time.time() - t0 > 60:
+                log(i, "agent busy; message queued")
+                warned = True
+            if time.time() - t0 > limit:
+                log(i, "error: still busy after limit; keeping the message queued")
+                return False
+            time.sleep(3)
+    finally:
+        QUEUED.pop(i, None)
+
+
 def deliver(i, m):
-    s = ensure(i)
-    text = " ".join(str(m["text"]).split())
-    p = PROMPT.format(id=m["id"], frm=m["from"], to=m["to"], text=text)
-    tmux("send-keys", "-t", s, "-l", p)
-    time.sleep(1.5)
-    tmux("send-keys", "-t", s, "Enter")
-    log(i, f"delivered #{m['id']} from {m['from']}")
+    """Returns True only when the message was verifiably submitted; False keeps the cursor (retry)."""
+    st = health(i)
+    if st["problem"] in DOWN:
+        alert(i, st["problem"], st)
+        log(i, f"pre-dispatch: {st['problem']}; #{m['id']} held, cursor not advanced")
+        return False
+    resolve(i, "session_missing")
+    resolve(i, "process_dead")
+    s = session(i)
+    p = PROMPT.format(id=m["id"], frm=m["from"], to=m["to"], text=" ".join(str(m["text"]).split()))
+    if not wait_idle(i, s):
+        return False
+    left = typed(s)
+    if left:
+        log(i, f"leftover input before #{m['id']} ({len(left)} chars); clearing with C-u")
+        tmux("send-keys", "-t", "=" + s + ":", "C-u")
+        time.sleep(0.8)
+        if typed(s):
+            log(i, f"error leftover input not cleared before #{m['id']}; cursor not advanced")
+            return False
+    before = inputline(s)
+    b = "runner-" + i
+    r = subprocess.run([*TMUX, "load-buffer", "-b", b, "-"], input=p, capture_output=True, text=True)
+    if r.returncode:
+        log(i, f"error load-buffer #{m['id']}: {r.stderr.strip()}")
+        return False
+    r = tmux("paste-buffer", "-p", "-d", "-b", b, "-t", "=" + s + ":")
+    if r.returncode:
+        log(i, f"error paste-buffer #{m['id']}: {r.stderr.strip()}")
+        return False
+    prev, same, landed, t0 = None, 0, None, time.time()
+    while time.time() - t0 < 20:  # wait until the input line changed and is stable
+        time.sleep(0.8)
+        cur = inputline(s)
+        same = same + 1 if cur == prev else 0
+        prev = cur
+        if cur != before and same >= 2:
+            landed = cur
+            break
+    if landed is None:
+        log(i, f"error #{m['id']} paste did not land; cursor not advanced")
+        return False
+    time.sleep(1.0)
+    for attempt in (1, 2):
+        r = tmux("send-keys", "-t", "=" + s + ":", "Enter")
+        if r.returncode:
+            log(i, f"error send Enter #{m['id']}: {r.stderr.strip()}")
+            return False
+        t0 = time.time()
+        while time.time() - t0 < 15:
+            time.sleep(1.0)
+            if busy(s) or inputline(s) != landed:
+                log(i, f"delivered #{m['id']} from {m['from']} (verified, enter x{attempt}, {len(p)} chars)")
+                return True
+    tmux("send-keys", "-t", "=" + s + ":", "C-u")
+    log(i, f"error #{m['id']} not submitted after 2 Enters; cleared input, cursor not advanced")
+    return False
 
 
 def loop(i):
-    key = open(os.path.join(CONF, f"{i}.key")).read().strip()
+    key = key_of(i)
     sf = os.path.join(STATE, f"{i}.last")
     since = int(open(sf).read()) if os.path.exists(sf) else None
     if since is None:  # first run: start from the newest message, don't replay history
         since = rpc(key, "board_wait", {"timeout_seconds": 0}).get("last_id", 0)
         open(sf, "w").write(str(since))
     log(i, f"polling since {since}")
+    ensure(i)
     while True:
         try:
             r = rpc(key, "board_wait", {"since_id": since, "timeout_seconds": 50})
-            for m in r.get("messages", []):
+            for m in sorted(r.get("messages", []), key=lambda x: x["id"]):
                 if str(m["from"]).lower() != i.lower():
-                    deliver(i, m)
+                    if not deliver(i, m):
+                        time.sleep(20)
+                        break  # retry from this message next round
                 since = max(since, m["id"])
                 open(sf, "w").write(str(since))
         except Exception as e:  # network blips, worker redeploys
@@ -115,15 +436,17 @@ def loop(i):
 
 
 def main():
-    if not URL:
+    if not URL and env("RUNNER_PATROL_ONLY") != "1":
         raise SystemExit("BOARD_URL is not set (see .env.example)")
     os.makedirs(LOGS, exist_ok=True)
     os.makedirs(STATE, exist_ok=True)
-    only = os.environ.get("BOARD_IDS")
-    ids = only.split(",") if only else identities()
-    for i in ids:
-        threading.Thread(target=loop, args=(i,), daemon=True).start()
-        time.sleep(1)
+    only = env("BOARD_IDS")
+    ids = csv(only) if only else identities()
+    if env("RUNNER_PATROL_ONLY") != "1":
+        for i in ids:
+            threading.Thread(target=loop, args=(i,), daemon=True).start()
+            time.sleep(1)
+    threading.Thread(target=patrol, args=(ids,), daemon=True).start()
     while True:
         time.sleep(3600)
 
