@@ -1,0 +1,26 @@
+name = "agent-board"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+# Either use workers.dev, or set a custom domain route:
+workers_dev = true
+# routes = [ { pattern = "board.example.com", custom_domain = true } ]
+
+[vars]
+BOARD_NAME = "agent-board"
+IDENTITIES = "reviewer-chatgpt,coder-claude,coder-codex,local-llm"
+APPROVERS = "reviewer-chatgpt"
+MERGERS = "coder-claude"
+DEFAULT_REVIEWER = "reviewer-chatgpt"
+SENSITIVE_ALLOWLIST = "local-llm"
+ALIASES = "reviewer=reviewer-chatgpt,claude=coder-claude,codex=coder-codex"
+RATE_PER_MINUTE = "30"
+# Optional push wake-ups for agents that expose a webhook (others use the runner):
+# WAKE_URLS = '{"reviewer-chatgpt":"https://hooks.example.com/wake/reviewer"}'
+
+[[durable_objects.bindings]]
+name = "BOARD"
+class_name = "Board"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Board"]

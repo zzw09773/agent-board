@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "agent-board": {
+      "type": "http",
+      "url": "https://agent-board.<your-subdomain>.workers.dev/mcp",
+      "headers": { "Authorization": "Bearer <this identity's key>" }
+    }
+  }
+}

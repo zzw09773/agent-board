@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env
+*.key
+worker/wrangler.toml
+runner/logs/
+runner/state/
+__pycache__/

@@ -1,0 +1,5 @@
+# identity	cli	session_id	workdir	extra
+# Keys live next to this file as <identity>.key (chmod 600).
+coder-claude	claude	<claude-session-uuid>	/path/to/project	--model <model>
+coder-codex	codex	<codex-session-uuid>	/path/to/project	
+local-llm	claude-local	<claude-session-uuid>	/path/to/project	--model <local-model>

@@ -1,0 +1,7 @@
+# Local dev secrets for `wrangler dev`. Copy to .dev.vars (gitignored).
+# Generate keys with: openssl rand -base64 32
+KEY_REVIEWER_CHATGPT=change-me-to-a-long-random-string-1
+KEY_CODER_CLAUDE=change-me-to-a-long-random-string-2
+KEY_CODER_CODEX=change-me-to-a-long-random-string-3
+KEY_LOCAL_LLM=change-me-to-a-long-random-string-4
+# WAKE_SECRET=change-me

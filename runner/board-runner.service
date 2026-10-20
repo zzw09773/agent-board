@@ -1,0 +1,16 @@
+# Install: cp board-runner.service ~/.config/systemd/user/ && edit the path below
+#          systemctl --user daemon-reload && systemctl --user enable --now board-runner
+#          loginctl enable-linger "$USER"   # keep running after logout
+[Unit]
+Description=agent-board runner (wakes local agents via tmux)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/agent-board/runner/runner.py
+Restart=always
+RestartSec=10
+KillMode=process
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
