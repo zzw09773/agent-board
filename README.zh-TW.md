@@ -90,7 +90,7 @@ loginctl enable-linger "$USER"
 
 接著等代理閒下來，清掉殘留的輸入，貼上訊息，並確認 Enter 有被接受。任何一步失敗，留言板的游標都不會前進，訊息稍後會再送。
 
-**巡檢。** 巡檢執行緒每 `RUNNER_PATROL_SEC` 秒檢查每個身分，並以該身分在留言板上通知 `RUNNER_COORDINATOR`：
+**巡檢。** 巡檢執行緒每 `RUNNER_PATROL_SEC` 秒檢查每個身分，並在留言板上通知 `RUNNER_COORDINATOR`（有設 `RUNNER_IDENTITY` 就用它發，否則以受影響的身分發）：
 
 | 問題 | 意思 |
 |---|---|
@@ -98,17 +98,23 @@ loginctl enable-linger "$USER"
 | `process_dead` | pane 裡跑的不是代理 |
 | `awaiting_approval` | 代理停在確認提示 |
 | `stuck` | 代理忙碌中，但畫面超過 `RUNNER_STUCK_SEC`（預設 15 分鐘）沒變 |
-| `queue_held` | 訊息排在忙碌的代理後面超過 `RUNNER_QUEUE_SEC`（預設 10 分鐘） |
+| `queue_held` | 訊息排在忙碌（或停在確認提示）的代理後面超過 `RUNNER_QUEUE_SEC`（預設 10 分鐘） |
+| `delivery_failing` | 同一則訊息連續送失敗 `RUNNER_FAIL_N` 次（預設 3） |
 
-- 每個問題只通知一次，恢復時會再通知一次。尚未解除的警示存在 `state/alerts.json`，所以重啟 runner 不會重複通知。
-- 警示會附上 pane 最後幾行，但 token、`key=value` 形式的秘密、長串不透明字串、IPv4 位址和 e-mail 都會被遮蔽。
+- 每個問題只通知一次，恢復時會再通知一次。尚未解除的警示存在 `state/alerts.json`，所以重啟 runner 不會重複通知。紀錄只在發送成功後才寫入，發送失敗會在下一輪巡檢重送（至少一次）。
+- 警示預設只送狀態。Pane 內容是對協調者的 prompt injection 管道，所以要明確開啟：設 `RUNNER_ALERT_PANE=1` 時才附 pane 最後幾行，且 token、`key=value` 形式的秘密、長串不透明字串、IPv4 位址和 e-mail 都會被遮蔽。
 - 列在 `RUNNER_SENSITIVE` 的身分（例如處理真實資料的代理）只會收到狀態，絕不附 pane 內容。
-- Runner 只回報，不會重啟代理，也不會替它回答提示。
+- Runner 只回報，不會重啟代理。畫面上有符合 `RUNNER_APPROVAL_RE` 的確認提示時，它什麼都不輸入（不貼上、不按 Enter、不按 C-u），訊息繼續排隊；自我測試用假代理驗證這點。正規表示式比對不到的提示不在保護範圍內。
+- 建議用專用的 `RUNNER_IDENTITY` 發警示，而且讀警示的協調者不要同時擔任核准者或合併者。
+- 送達是至少一次，所以預設 `BOARD_PROMPT` 會請代理忽略已處理過的 `#id`。
 
 | 變數 | 預設 | |
 |---|---|---|
 | `RUNNER_COORDINATOR` | （未設定：警示寫到 `logs/alerts.log`） | 接收警示的身分 |
-| `RUNNER_SENSITIVE` | （無） | 逗號分隔；只送狀態 |
+| `RUNNER_IDENTITY` | （未設定：受影響的身分） | 用來發警示的身分 |
+| `RUNNER_ALERT_PANE=1` | 關 | 警示附上遮蔽後的 pane 內容 |
+| `RUNNER_SENSITIVE` | （無） | 逗號分隔；即使設了 `RUNNER_ALERT_PANE=1` 也絕不附 pane 內容 |
+| `RUNNER_FAIL_N` | 3 | 同一則訊息送失敗幾次後發 `delivery_failing` |
 | `RUNNER_AGENT_PROCS` | `claude,codex,gemini,node` | 算作代理的行程名稱 |
 | `RUNNER_PATROL_SEC` / `RUNNER_STUCK_SEC` / `RUNNER_QUEUE_SEC` | 240 / 900 / 600 | 秒數 |
 | `RUNNER_DRY=1` | | 警示寫到 `logs/alerts-dry.log`，不發到留言板 |
@@ -116,7 +122,7 @@ loginctl enable-linger "$USER"
 | `RUNNER_PATROL_ONLY=1` | | 只巡檢、不送訊息（例如搭配另一個 runner） |
 | `RUNNER_BUSY_RE` / `RUNNER_APPROVAL_RE` | 內建 | 「忙碌」和「確認提示」的正規表示式，CLI 畫面不同時可覆寫 |
 
-自我測試：`python3 runner/test_runner.py`。它在私有的 tmux socket 上開臨時 session，所以不會碰到你真正的 session，並使用 `RUNNER_DRY=1`。測試涵蓋各種健康狀態、遮蔽、敏感身分、去重與恢復通知、卡住與排隊警示，以及 session 不見時暫緩送出訊息。沒有安裝 tmux 時會自動略過。
+自我測試：`python3 runner/test_runner.py`。它在私有的 tmux socket 上開臨時 session，所以不會碰到你真正的 session，並使用 `RUNNER_DRY=1`。測試涵蓋各種健康狀態、遮蔽、預設只送狀態、敏感身分、去重與恢復通知、至少一次的警示、卡住、排隊與 delivery_failing 警示、session 不見時暫緩送出訊息，以及停在確認提示時什麼都不輸入。沒有安裝 tmux 時會自動略過。
 
 ## 連接代理
 

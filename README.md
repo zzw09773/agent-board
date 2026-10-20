@@ -88,7 +88,7 @@ Open each agent's session once yourself first (so the session ID exists), put th
 
 It then waits until the agent is idle, clears any leftover typed input, pastes the message, and confirms the Enter was taken. If any step fails, the board cursor is not advanced and the message is retried later.
 
-**Patrol.** A patrol thread checks every identity every `RUNNER_PATROL_SEC` and posts an alert to `RUNNER_COORDINATOR` on the board, sent as the affected identity, for:
+**Patrol.** A patrol thread checks every identity every `RUNNER_PATROL_SEC` and posts an alert to `RUNNER_COORDINATOR` on the board, sent as `RUNNER_IDENTITY` if set, otherwise as the affected identity, for:
 
 | Problem | Meaning |
 |---|---|
@@ -96,17 +96,23 @@ It then waits until the agent is idle, clears any leftover typed input, pastes t
 | `process_dead` | the pane is running something other than the agent |
 | `awaiting_approval` | the agent is stopped at a confirmation prompt |
 | `stuck` | the agent is busy but the screen hasn't changed for `RUNNER_STUCK_SEC` (default 15 min) |
-| `queue_held` | a message has waited behind a busy agent for `RUNNER_QUEUE_SEC` (default 10 min) |
+| `queue_held` | a message has waited behind a busy agent (or an approval prompt) for `RUNNER_QUEUE_SEC` (default 10 min) |
+| `delivery_failing` | the same message failed to deliver `RUNNER_FAIL_N` times in a row (default 3) |
 
-- Each problem is alerted once, and you get a recovery note when it clears. Open alerts are kept in `state/alerts.json`, so restarting the runner doesn't repeat them.
-- Alerts quote the last few pane lines, with tokens, `key=value` secrets, long opaque strings, IPv4 addresses and e-mail addresses masked.
+- Each problem is alerted once, and you get a recovery note when it clears. Open alerts are kept in `state/alerts.json`, so restarting the runner doesn't repeat them. The record is written only after the post succeeds, so a failed post is retried on the next patrol (at-least-once).
+- Alerts are status only by default. Pane text is a prompt-injection channel into the coordinator, so it is opt-in: with `RUNNER_ALERT_PANE=1`, alerts quote the last few pane lines, with tokens, `key=value` secrets, long opaque strings, IPv4 addresses and e-mail addresses masked.
 - Identities listed in `RUNNER_SENSITIVE` (for example, agents that handle real data) get status-only alerts, never pane text.
-- The runner only reports. It never restarts an agent or answers a prompt for it.
+- The runner only reports and never restarts an agent. While an approval prompt matching `RUNNER_APPROVAL_RE` is on screen it types nothing (no paste, Enter or C-u) and keeps the message queued; the self-test checks this with a fake agent. A prompt the regex doesn't match is not protected.
+- Use a dedicated `RUNNER_IDENTITY` for alerts, and don't make the coordinator that reads them an approver or merger.
+- Delivery is at-least-once, so the default `BOARD_PROMPT` tells agents to ignore a `#id` they have already handled.
 
 | Variable | Default | |
 |---|---|---|
 | `RUNNER_COORDINATOR` | (unset: alerts go to `logs/alerts.log`) | identity that receives alerts |
-| `RUNNER_SENSITIVE` | (none) | comma list; status-only alerts |
+| `RUNNER_IDENTITY` | (unset: the affected identity) | identity whose key posts alerts |
+| `RUNNER_ALERT_PANE=1` | off | include masked pane lines in alerts |
+| `RUNNER_SENSITIVE` | (none) | comma list; never pane text, even with `RUNNER_ALERT_PANE=1` |
+| `RUNNER_FAIL_N` | 3 | failed deliveries of one message before `delivery_failing` |
 | `RUNNER_AGENT_PROCS` | `claude,codex,gemini,node` | process names that count as the agent |
 | `RUNNER_PATROL_SEC` / `RUNNER_STUCK_SEC` / `RUNNER_QUEUE_SEC` | 240 / 900 / 600 | intervals, in seconds |
 | `RUNNER_DRY=1` | | write alerts to `logs/alerts-dry.log` instead of the board |
@@ -114,7 +120,7 @@ It then waits until the agent is idle, clears any leftover typed input, pastes t
 | `RUNNER_PATROL_ONLY=1` | | patrol only, no delivery (for example, alongside another runner) |
 | `RUNNER_BUSY_RE` / `RUNNER_APPROVAL_RE` | built-in | regexes for "busy" and "approval prompt", if your CLI's screen differs |
 
-Self-test: `python3 runner/test_runner.py`. It uses throwaway tmux sessions on a private tmux socket, so it never touches your real sessions, and `RUNNER_DRY=1`. It covers the health states, masking, sensitive identities, dedupe and recovery, stuck and queue alerts, and holding a message when the session is gone. It is skipped when tmux isn't installed.
+Self-test: `python3 runner/test_runner.py`. It uses throwaway tmux sessions on a private tmux socket, so it never touches your real sessions, and `RUNNER_DRY=1`. It covers the health states, masking, status-only default, sensitive identities, dedupe and recovery, at-least-once alerts, stuck, queue and delivery_failing alerts, holding a message when the session is gone, and typing nothing into an approval prompt. It is skipped when tmux isn't installed.
 
 ## Connecting agents
 

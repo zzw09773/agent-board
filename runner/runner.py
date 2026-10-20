@@ -13,14 +13,22 @@ taken. If anything fails, the board cursor is NOT advanced, so the message is re
 A patrol thread checks every identity every RUNNER_PATROL_SEC and alerts the coordinator
 on the board (once per problem, plus a recovery note): session gone, agent process dead,
 stopped at an approval prompt, busy with no screen change for RUNNER_STUCK_SEC, or a
-message queued behind a busy agent for RUNNER_QUEUE_SEC. The runner only reports; it never
-restarts agents or answers prompts for them.
+message queued behind a busy agent for RUNNER_QUEUE_SEC, or the same message failing to
+deliver RUNNER_FAIL_N times in a row. The runner only reports; it never restarts agents.
+It types nothing (no paste, no Enter, no C-u) while an approval prompt is on screen: the
+message stays queued until a human answers the prompt (covered by test_runner.py).
+Alerts are status only by default; pane text is a prompt-injection channel into the
+coordinator, so it is opt-in (RUNNER_ALERT_PANE=1).
 
 Config (env or .env next to this file):
   BOARD_URL            https://<your-worker>/mcp
   BOARD_CONFIG_DIR     directory holding identities.tsv and <identity>.key files
   BOARD_IDS            optional comma list to run only some identities
   RUNNER_COORDINATOR   identity that receives patrol alerts (unset = alerts only go to the logs)
+  RUNNER_IDENTITY      optional dedicated identity whose key posts alerts (default: the affected
+                       identity's own key). The coordinator should not also be an approver or merger.
+  RUNNER_ALERT_PANE=1  include masked last pane lines in alerts (default: status only)
+  RUNNER_FAIL_N        consecutive failed deliveries of one message before delivery_failing, default 3
   RUNNER_SENSITIVE     comma list of identities whose alerts carry status only, never pane text
                        (e.g. agents that handle sensitive data)
   RUNNER_AGENT_PROCS   comma list of process names that count as "the agent is alive"
@@ -70,10 +78,14 @@ AGENT_PROCS = set(csv(env("RUNNER_AGENT_PROCS", "claude,codex,gemini,node")))
 PATROL_SEC = int(env("RUNNER_PATROL_SEC", "240"))
 STUCK_SEC = int(env("RUNNER_STUCK_SEC", "900"))
 QUEUE_SEC = int(env("RUNNER_QUEUE_SEC", "600"))
+FAIL_N = int(env("RUNNER_FAIL_N", "3"))
+ALERT_PANE = env("RUNNER_ALERT_PANE") == "1"
+RUNNER_IDENTITY = env("RUNNER_IDENTITY", "")
 PROMPT = env(
     "BOARD_PROMPT",
     '[board #{id} from {frm} to {to}] {text} -- Handle this, then reply with the board tool '
-    'board_post to="{frm}" (start with "Re #{id}"). Never paste secrets or sensitive data on the board.',
+    'board_post to="{frm}" (start with "Re #{id}"). If you have already handled #{id}, ignore this copy '
+    '(the runner may redeliver). Never paste secrets or sensitive data on the board.',
 )
 # Screen patterns of common agent CLIs. Override with RUNNER_BUSY_RE / RUNNER_APPROVAL_RE if yours differ.
 BUSY = re.compile(env("RUNNER_BUSY_RE", r"esc to interrupt|esc to cancel|• Working|Working \(|Thinking…|✻ \w+ing…|\(esc to"))
@@ -87,7 +99,8 @@ SECRET = re.compile(r"(?:sk|pk|ghp|gho|ghs|github_pat|xox[abp]|AKIA)[-_A-Za-z0-9
                     r"|\b(?:\d{1,3}\.){3}\d{1,3}\b|\S+@\S+", re.I)
 NAMES = {"session_missing": "tmux session is gone", "process_dead": "agent process is not running",
          "awaiting_approval": "stopped at an approval prompt", "stuck": "busy but the screen has not changed",
-         "queue_held": "a message has been waiting behind a busy agent"}
+         "queue_held": "a message has been waiting behind a busy agent",
+         "delivery_failing": "the same message keeps failing to deliver"}
 DOWN = ("session_missing", "process_dead")
 
 
@@ -149,10 +162,14 @@ def cap(s):
     return r.stdout if r.returncode == 0 else None
 
 
+def rows(s):
+    """Pane rows without the blank rows below the cursor."""
+    return (cap(s) or "").rstrip().splitlines()
+
+
 def tail(s, n):
     """Last n lines of the pane, ignoring the blank rows below the cursor."""
-    lines = (cap(s) or "").rstrip().splitlines()
-    return "\n".join(lines[-n:])
+    return "\n".join(rows(s)[-n:])
 
 
 def busy(s):
@@ -163,7 +180,7 @@ def inputline(s):
     c = cap(s)
     if c is None:
         return None
-    for x in reversed(c.splitlines()[-15:]):
+    for x in reversed(c.rstrip().splitlines()[-15:]):
         m = INPUT.match(x)
         if m:
             return m.group(1).strip()
@@ -239,23 +256,25 @@ def post(i, text):
         with open(os.path.join(LOGS, "alerts-dry.log" if DRY else "alerts.log"), "a") as f:
             f.write(f"{datetime.datetime.now():%m-%d %H:%M:%S} [{i}] {text}\n")
         return
-    rpc(key_of(i), "board_post", {"to": COORDINATOR, "text": text}, timeout=30)  # posted as the affected identity
+    # posted with the dedicated runner identity if set, else as the affected identity
+    rpc(key_of(RUNNER_IDENTITY or i), "board_post", {"to": COORDINATOR, "text": text}, timeout=30)
 
 
 def alert(i, prob, st=None):
+    """At-least-once: the dedupe record is written only after the post succeeds; a failed post
+    is retried by the next patrol pass (or delivery attempt) that still sees the problem."""
+    k = f"{i}|{prob}"
     with _lock:
-        a = _alerts()
-        k = f"{i}|{prob}"
-        if k in a:
+        if k in _alerts():
             return False
-        a[k] = time.time()
-        _save(a)
     st = st or {}
     t = f"[runner patrol] {i}: {NAMES.get(prob, prob)}" + (f" ({st['detail']})" if st.get("detail") else "")
     if prob in ("stuck", "queue_held"):
         t += f", for about {int(st.get('dur', 0) // 60)} min"
-    if i in SENSITIVE:
-        t += ". Status only: no screen text is sent for this identity."
+    if prob == "delivery_failing":
+        t += f" (#{st.get('mid')} failed {st.get('n')} times in a row)"
+    if i in SENSITIVE or not ALERT_PANE:
+        t += ". Status only: no screen text is sent."
     elif prob != "session_missing":
         ll = lastlines(i)
         if ll:
@@ -263,9 +282,14 @@ def alert(i, prob, st=None):
     t += "\n(The runner only reports; it does not restart or type for the agent. You will get a note when it recovers.)"
     try:
         post(i, t)
-        log(i, f"alert posted: {prob}")
     except Exception as e:
-        log(i, f"error alert post {prob}: {e!r}")
+        log(i, f"error alert post {prob}: {e!r}; will retry")
+        return False
+    with _lock:
+        a = _alerts()
+        a[k] = time.time()
+        _save(a)
+    log(i, f"alert posted: {prob}")
     return True
 
 
@@ -275,13 +299,17 @@ def resolve(i, prob):
         k = f"{i}|{prob}"
         if k not in a:
             return False
-        t0 = a.pop(k)
-        _save(a)
+        t0 = a[k]
     try:
         post(i, f"[runner patrol] {i}: recovered ({NAMES.get(prob, prob)}, after about {int((time.time() - t0) // 60)} min)")
-        log(i, f"recovery posted: {prob}")
     except Exception as e:
-        log(i, f"error recovery post {prob}: {e!r}")
+        log(i, f"error recovery post {prob}: {e!r}; will retry")
+        return False
+    with _lock:
+        a = _alerts()
+        a.pop(k, None)
+        _save(a)
+    log(i, f"recovery posted: {prob}")
     return True
 
 
@@ -318,6 +346,11 @@ def patrol_once(ids, seen):
                 alert(i, "queue_held", {"dur": time.time() - qt})
             elif not qt:
                 resolve(i, "queue_held")
+            f = FAILS.get(i)
+            if f and f[1] >= FAIL_N:
+                alert(i, "delivery_failing", {"mid": f[0], "n": f[1]})
+            elif not f:
+                resolve(i, "delivery_failing")
         except Exception as e:
             log(i, f"error patrol {e!r}")
 
@@ -330,6 +363,27 @@ def patrol(ids):
 
 
 # ---------- delivery ----------
+FAILS = {}  # identity -> [message id, consecutive failed delivery attempts]
+
+
+def gate(i, m):
+    """True when nothing may be typed: an approval prompt (or an outage) is on screen."""
+    st = health(i)
+    if st["problem"]:
+        QUEUED.setdefault(i, time.time())
+        alert(i, st["problem"], st)
+        log(i, f"gate: {st['problem']}; #{m['id']} queued, nothing typed")
+        return True
+    return False
+
+
+def note_result(i, m, ok):
+    """Count consecutive real failures (False) of the same message; holds (None) don't count."""
+    if ok:
+        FAILS.pop(i, None)
+    elif ok is False:
+        f = FAILS.get(i)
+        FAILS[i] = [m["id"], f[1] + 1] if f and f[0] == m["id"] else [m["id"], 1]
 def wait_idle(i, s, limit=3600):
     t0 = time.time()
     warned = False
@@ -352,18 +406,26 @@ def wait_idle(i, s, limit=3600):
 
 
 def deliver(i, m):
-    """Returns True only when the message was verifiably submitted; False keeps the cursor (retry)."""
+    """True = verifiably submitted. None = held (outage, busy or approval prompt; nothing typed).
+    False = a delivery attempt failed. Both falsy results keep the cursor (retry)."""
     st = health(i)
     if st["problem"] in DOWN:
         alert(i, st["problem"], st)
         log(i, f"pre-dispatch: {st['problem']}; #{m['id']} held, cursor not advanced")
-        return False
+        return None
+    if st["problem"] == "awaiting_approval":  # treat like busy: queue, type nothing
+        QUEUED.setdefault(i, time.time())
+        alert(i, "awaiting_approval", st)
+        log(i, f"pre-dispatch: awaiting_approval; #{m['id']} queued, nothing typed")
+        return None
     resolve(i, "session_missing")
     resolve(i, "process_dead")
     s = session(i)
     p = PROMPT.format(id=m["id"], frm=m["from"], to=m["to"], text=" ".join(str(m["text"]).split()))
     if not wait_idle(i, s):
-        return False
+        return None
+    if gate(i, m):
+        return None
     left = typed(s)
     if left:
         log(i, f"leftover input before #{m['id']} ({len(left)} chars); clearing with C-u")
@@ -372,6 +434,8 @@ def deliver(i, m):
         if typed(s):
             log(i, f"error leftover input not cleared before #{m['id']}; cursor not advanced")
             return False
+    if gate(i, m):
+        return None
     before = inputline(s)
     b = "runner-" + i
     r = subprocess.run([*TMUX, "load-buffer", "-b", b, "-"], input=p, capture_output=True, text=True)
@@ -396,6 +460,8 @@ def deliver(i, m):
         return False
     time.sleep(1.0)
     for attempt in (1, 2):
+        if gate(i, m):  # never press anything (not even C-u) into an approval prompt
+            return None
         r = tmux("send-keys", "-t", "=" + s + ":", "Enter")
         if r.returncode:
             log(i, f"error send Enter #{m['id']}: {r.stderr.strip()}")
@@ -425,7 +491,9 @@ def loop(i):
             r = rpc(key, "board_wait", {"since_id": since, "timeout_seconds": 50})
             for m in sorted(r.get("messages", []), key=lambda x: x["id"]):
                 if str(m["from"]).lower() != i.lower():
-                    if not deliver(i, m):
+                    ok = deliver(i, m)
+                    note_result(i, m, ok)
+                    if not ok:
                         time.sleep(20)
                         break  # retry from this message next round
                 since = max(since, m["id"])
