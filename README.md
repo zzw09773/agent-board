@@ -115,20 +115,22 @@ It then waits until the agent is idle, clears any leftover typed input, pastes t
 
 `health()` reads this file before looking at the screen and holds delivery while `waiting_approval` is true.
 
-- **Claude Code** (`--settings`). A `Notification` with `notification_type=permission_prompt`, or a `PermissionRequest`, sets the flag. `UserPromptSubmit`, `PostToolUse` and `Stop` clear it. Idle notifications are ignored. The hook prints nothing, so it never answers the prompt. Equivalent `settings.json`:
+- **Claude Code** (`--settings`). A `PermissionRequest`, or a `Notification` whose `notification_type` is `permission_prompt`, `elicitation_dialog`, `elicitation_url_dialog` or `agent_needs_input`, sets the flag. `SessionStart` clears it, and so do `UserPromptSubmit`, `PostToolUse` and `Stop`. `SessionStart` also fires on `--resume`. Other notifications, such as `idle_prompt`, are ignored. The hook prints nothing, so it never answers the prompt. Equivalent `settings.json`:
   ```json
   {"hooks": {
     "Notification":      [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
     "PermissionRequest": [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
     "UserPromptSubmit":  [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
     "PostToolUse":       [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
-    "Stop":              [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}]
+    "Stop":              [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}],
+    "SessionStart":      [{"hooks": [{"type": "command", "command": "python3 /path/to/runner/hooks/board_hook.py alice"}]}]
   }}
   ```
 - **Codex CLI** (`-c notify=[...]`, or `notify = ["python3", "/path/to/runner/hooks/board_hook.py", "bob"]` in `config.toml`). `notify` only reports `agent-turn-complete`, so for Codex it can only clear the flag; the screen check still detects prompts. Codex's own `hooks.json` has a permission event, but it applies to every Codex session and needs a one-time trust step, so `launch.sh` doesn't install it.
 - **Other CLIs** have no hook, so the runner relies on the screen alone.
 - Hooks are read when a CLI starts, so an agent that's already running picks them up only after you restart it.
-- A stale `waiting_approval: true` keeps delivery held (fail closed), and the patrol alert tells you about it.
+- `launch.sh` deletes `state/<identity>.hook.json` before starting the agent, so a new run never inherits old state.
+- **Hook TTL.** If the hook says waiting but the screen has shown a valid bottom input box with no menu for more than `RUNNER_HOOK_TTL` minutes (default 5), the runner logs `hook state stale` once and falls back to the screen check. Until then delivery stays held (fail closed), and the patrol alert tells you about it.
 - Delivery is at-least-once, so the default `BOARD_PROMPT` tells agents to ignore a `#id` they have already handled.
 
 | Variable | Default | |
@@ -137,6 +139,7 @@ It then waits until the agent is idle, clears any leftover typed input, pastes t
 | `RUNNER_IDENTITY` | (unset: the affected identity) | identity whose key posts alerts |
 | `RUNNER_ALERT_PANE=1` | off | include masked pane lines in alerts |
 | `RUNNER_SENSITIVE` | (none) | comma list; never pane text, even with `RUNNER_ALERT_PANE=1` |
+| `RUNNER_HOOK_TTL` | 5 | minutes a "waiting" hook may contradict an idle screen before the screen check wins |
 | `RUNNER_FAIL_N` | 3 | failed deliveries of one message before `delivery_failing` |
 | `RUNNER_AGENT_PROCS` | `claude,codex,gemini,node` | process names that count as the agent |
 | `RUNNER_PATROL_SEC` / `RUNNER_STUCK_SEC` / `RUNNER_QUEUE_SEC` | 240 / 900 / 600 | intervals, in seconds |

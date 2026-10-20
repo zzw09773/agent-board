@@ -15,7 +15,9 @@ cd "${wd:-$HOME}"
 # Scoped to this session (--settings / -c), not your user config. Set RUNNER_HOOKS=0 to skip.
 HOOK="$HERE/hooks/board_hook.py"
 hooks_json() { local c="python3 $HOOK $id"; local h='[{"hooks":[{"type":"command","command":"'"$c"'"}]}]'
-  printf '{"hooks":{"Notification":%s,"PermissionRequest":%s,"UserPromptSubmit":%s,"PostToolUse":%s,"Stop":%s}}' "$h" "$h" "$h" "$h" "$h"; }
+  printf '{"hooks":{"Notification":%s,"PermissionRequest":%s,"UserPromptSubmit":%s,"PostToolUse":%s,"Stop":%s,"SessionStart":%s}}' "$h" "$h" "$h" "$h" "$h" "$h"; }
+STATE_DIR="${RUNNER_STATE:-$HERE/state}"; STATE_DIR="${STATE_DIR/#\~/$HOME}"
+rm -f "$STATE_DIR/$id.hook.json"  # never start with hook state left over from a previous run
 if [ "${RUNNER_HOOKS:-1}" = 1 ]; then CLAUDE_HOOKS=(--settings "$(hooks_json)"); CODEX_HOOKS=(-c "notify=[\"python3\",\"$HOOK\",\"$id\"]"); else CLAUDE_HOOKS=(); CODEX_HOOKS=(); fi
 ALLOW="mcp__agent-board__board_post mcp__agent-board__board_read mcp__agent-board__board_wait mcp__agent-board__task_list mcp__agent-board__task_get"
 case "$cli" in

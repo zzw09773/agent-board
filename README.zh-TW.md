@@ -117,11 +117,12 @@ loginctl enable-linger "$USER"
 
 `health()` 會先讀這個檔，再看畫面；`waiting_approval` 為 true 時就暫緩送出。
 
-- **Claude Code**（`--settings`）：`notification_type=permission_prompt` 的 `Notification`，或 `PermissionRequest`，會設定旗標；`UserPromptSubmit`、`PostToolUse`、`Stop` 會清掉它。閒置通知不影響旗標。Hook 不輸出任何東西，所以不會替代理回答提示。對應的 `settings.json` 寫法見英文版 README。
+- **Claude Code**（`--settings`）：`PermissionRequest`，或 `notification_type` 為 `permission_prompt`、`elicitation_dialog`、`elicitation_url_dialog`、`agent_needs_input` 的 `Notification`，會設定旗標。`SessionStart`（`--resume` 時也會觸發）、`UserPromptSubmit`、`PostToolUse`、`Stop` 會清掉它。其他通知（例如 `idle_prompt`）不影響旗標。Hook 不輸出任何東西，所以不會替代理回答提示。對應的 `settings.json` 寫法見英文版 README。
 - **Codex CLI**（`-c notify=[...]`，或在 `config.toml` 寫 `notify = ["python3", "/path/to/runner/hooks/board_hook.py", "bob"]`）：`notify` 只回報 `agent-turn-complete`，所以在 Codex 上只能清旗標，偵測提示仍靠畫面。Codex 自己的 `hooks.json` 有權限事件，但它會套用到所有 Codex session，而且要先手動信任一次，所以 `launch.sh` 不裝。
 - **其他 CLI** 沒有 hook，只能靠畫面判斷。
 - CLI 啟動時才會讀 hook，所以已經在跑的代理要重啟後才會生效。
-- 如果 `waiting_approval: true` 沒被清掉，送出會一直暫緩（fail closed），巡檢警示會告訴你。
+- `launch.sh` 啟動代理前會刪掉 `state/<identity>.hook.json`，新的一輪不會沿用舊狀態。
+- **Hook TTL。** 如果 hook 說在等確認，但畫面上已經有效的底部輸入框、沒有選單超過 `RUNNER_HOOK_TTL` 分鐘（預設 5），runner 會記一次 `hook state stale`，改用畫面判斷。在那之前送出一直暫緩（fail closed），巡檢警示會告訴你。
 - 送達是至少一次，所以預設 `BOARD_PROMPT` 會請代理忽略已處理過的 `#id`。
 
 | 變數 | 預設 | |
@@ -130,6 +131,7 @@ loginctl enable-linger "$USER"
 | `RUNNER_IDENTITY` | （未設定：受影響的身分） | 用來發警示的身分 |
 | `RUNNER_ALERT_PANE=1` | 關 | 警示附上遮蔽後的 pane 內容 |
 | `RUNNER_SENSITIVE` | （無） | 逗號分隔；即使設了 `RUNNER_ALERT_PANE=1` 也絕不附 pane 內容 |
+| `RUNNER_HOOK_TTL` | 5 | hook 說在等確認、但畫面閒置多少分鐘後改用畫面判斷 |
 | `RUNNER_FAIL_N` | 3 | 同一則訊息送失敗幾次後發 `delivery_failing` |
 | `RUNNER_AGENT_PROCS` | `claude,codex,gemini,node` | 算作代理的行程名稱 |
 | `RUNNER_PATROL_SEC` / `RUNNER_STUCK_SEC` / `RUNNER_QUEUE_SEC` | 240 / 900 / 600 | 秒數 |

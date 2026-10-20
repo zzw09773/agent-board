@@ -28,6 +28,8 @@ Config (env or .env next to this file):
   RUNNER_IDENTITY      optional dedicated identity whose key posts alerts (default: the affected
                        identity's own key). The coordinator should not also be an approver or merger.
   RUNNER_ALERT_PANE=1  include masked last pane lines in alerts (default: status only)
+  RUNNER_HOOK_TTL      minutes a "waiting" hook state may contradict an idle screen before the
+                       screen check wins (logged as "hook state stale"), default 5
   RUNNER_FAIL_N        consecutive failed deliveries of one message before delivery_failing, default 3
   RUNNER_SENSITIVE     comma list of identities whose alerts carry status only, never pane text
                        (e.g. agents that handle sensitive data)
@@ -217,7 +219,8 @@ def find_input(lines, cur=""):
     if k is None:
         return None
     n = k + 1
-    while n < len(lines) and cur and not BORDER.match(lines[n]) and _flat(lines[n]) and _flat(lines[n]) in cur:
+    while (n < len(lines) and cur and not BORDER.match(lines[n]) and not menuish(lines[n])
+           and _flat(lines[n]) and _flat(lines[n]) in cur):  # a menu row is never a wrap, even if quoted earlier
         n += 1
     end = n if n < len(lines) and BORDER.match(lines[n]) else None
     rest = lines[end + 1:] if end is not None else lines[n:]
@@ -272,6 +275,11 @@ def busy(s):
     return busy_in(rows(s), RECENT.get(s, []))
 
 
+HOOK_TTL = int(env("RUNNER_HOOK_TTL", "5")) * 60  # minutes the screen may contradict a "waiting" hook
+HOOK_CLEAN = {}         # identity -> since when the screen looked idle while the hook said waiting
+HOOK_STALE_LOGGED = {}  # identity -> hook ts already logged as stale
+
+
 def hook_state(i):
     """state/<identity>.hook.json written by runner/hooks/board_hook.py, or None."""
     try:
@@ -324,9 +332,20 @@ def health(i):
     if dead == "1" or not (cmd in AGENT_PROCS or AGENT_PROCS.intersection(kids)):
         return {"problem": "process_dead", "detail": f"pane is running {cmd or '?'}, no agent process"}
     h = hook_state(i)
-    if h and h.get("waiting_approval"):
-        return {"problem": "awaiting_approval", "detail": f"hook reports a permission prompt ({h.get('event')})"}
     why = approval_on(s)
+    if h and h.get("waiting_approval"):
+        if why is None:  # the screen shows a valid bottom input box and no menu
+            t0 = HOOK_CLEAN.setdefault(i, time.time())
+            if time.time() - t0 > HOOK_TTL:
+                if HOOK_STALE_LOGGED.get(i) != h.get("ts"):
+                    HOOK_STALE_LOGGED[i] = h.get("ts")
+                    log(i, f"hook state stale ({h.get('event')}): idle input box on screen for over "
+                           f"{HOOK_TTL // 60} min; using the screen check")
+                return {"problem": None, "busy": busy(s), "hook_stale": True}
+        else:
+            HOOK_CLEAN.pop(i, None)
+        return {"problem": "awaiting_approval", "detail": f"hook reports a permission prompt ({h.get('event')})"}
+    HOOK_CLEAN.pop(i, None)
     if why == "no_input":
         return {"problem": "awaiting_approval", "detail": "no input box on screen; possibly a prompt"}
     if why:

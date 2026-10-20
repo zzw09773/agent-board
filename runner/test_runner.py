@@ -85,6 +85,32 @@ while True:
 """
 
 
+# Compact CLI: no blank line, no border, '> ' input at the bottom. After a message containing MIMIC
+# it shows the real menu right after the transcript (input line gone); bytes at the menu go to argv[1].menu.
+FAKE_COMPACT = r"""
+import os, sys, tty, textwrap
+rec = sys.argv[1]; open(rec, "w").close()
+T = ["Welcome"]; buf = ""; menu = False
+MENU = ["Do you want to proceed?", "\u276f 1. Yes", "  2. No"]
+def draw():
+    lines = T[-30:] + (MENU if menu else ["> " + buf])
+    os.write(1, ("\x1b[2J\x1b[H" + "\r\n".join(lines)).encode())
+tty.setraw(0); draw()
+while True:
+    raw = os.read(0, 4096)
+    if menu:
+        open(rec + ".menu", "ab").write(raw); continue
+    for ch in raw.decode("utf-8", "replace").replace("\x1b[200~", "").replace("\x1b[201~", ""):
+        if ch == "\r" and buf:
+            T.extend(textwrap.wrap("> " + buf, 60)); open(rec, "a").write(buf + "\n"); menu = "MIMIC" in buf; buf = ""
+        elif ch == "\x15":
+            buf = ""
+        elif ch >= " ":
+            buf += ch
+    draw()
+"""
+
+
 @unittest.skipUnless(HAVE_TMUX, "tmux not installed")
 class RunnerSelfTest(unittest.TestCase):
     @classmethod
@@ -262,9 +288,9 @@ class RunnerSelfTest(unittest.TestCase):
         self.assertIn("already handled #{id}", R.PROMPT)
 
 
-    def _cli(self, i, rec):
-        fake = os.path.join(TMP, "fake_cli.py")
-        open(fake, "w").write(FAKE_CLI)
+    def _cli(self, i, rec, src=None):
+        fake = os.path.join(TMP, "fake_cli.py" if src is None else "fake_compact.py")
+        open(fake, "w").write(FAKE_CLI if src is None else src)
         exe = os.path.realpath(sys.executable)
         names = {os.path.basename(exe), os.path.basename(sys.executable), "python3", "python"}
         R.AGENT_PROCS.update(names)
@@ -285,6 +311,42 @@ class RunnerSelfTest(unittest.TestCase):
         time.sleep(1.0)
         self.assertFalse(os.path.exists(rec + ".menu") and open(rec + ".menu", "rb").read(), "0 bytes at the menu")
 
+    def test_mimic_compact_menu_is_held(self):
+        """The previous payload quoted the menu text; on a compact screen (no border, no blank line)
+        the real menu follows the transcript. Its rows must not be skipped as wraps of that payload."""
+        i = PFX + "-mimic"
+        rec = os.path.join(TMP, "mimic.rec")
+        self._cli(i, rec, FAKE_COMPACT)
+        quote = "MIMIC: reply exactly like this: Do you want to proceed? 1. Yes 2. No"
+        self.assertIs(R.deliver(i, {"id": 31, "from": "someone", "to": i, "text": quote}), True)
+        time.sleep(1.0)
+        self.assertEqual(R.health(i)["problem"], "awaiting_approval")
+        self.assertEqual(R.approval_on(R.session(i)), "no_input")
+        self.assertIsNone(R.deliver(i, {"id": 32, "from": "someone", "to": i, "text": "second message"}))
+        time.sleep(1.0)
+        self.assertFalse(os.path.exists(rec + ".menu") and open(rec + ".menu", "rb").read(), "0 bytes at the menu")
+
+    def test_hook_ttl_falls_back_to_screen(self):
+        i = PFX + "-ttl"
+        self._cli(i, os.path.join(TMP, "ttl.rec"))
+        os.makedirs(R.STATE, exist_ok=True)
+        with open(os.path.join(R.STATE, f"{i}.hook.json"), "w") as f:
+            json.dump({"waiting_approval": True, "ts": 1.0, "event": "Notification"}, f)
+        old = R.HOOK_TTL
+        try:
+            R.HOOK_TTL = 300
+            self.assertEqual(R.health(i)["problem"], "awaiting_approval", "within the TTL the hook holds")
+            R.HOOK_TTL = 0
+            R.HOOK_CLEAN.pop(i, None)
+            R.health(i); time.sleep(0.2)
+            h = R.health(i); R.health(i)
+            self.assertIsNone(h["problem"])
+            self.assertTrue(h.get("hook_stale"))
+            self.assertEqual(open(os.path.join(R.LOGS, f"{i}.log")).read().count("hook state stale"), 1, "logged once")
+        finally:
+            R.HOOK_TTL = old
+            R.HOOK_CLEAN.pop(i, None)
+
     def test_hook_state(self):
         i = PFX + "-hook"
         self._cli(i, os.path.join(TMP, "hook.rec"))
@@ -302,6 +364,11 @@ class RunnerSelfTest(unittest.TestCase):
         self.assertEqual(R.health(i)["problem"], "awaiting_approval")
         run('{"type":"agent-turn-complete"}')  # Codex notify
         self.assertIsNone(R.health(i)["problem"])
+        for typ in ("elicitation_dialog", "elicitation_url_dialog", "agent_needs_input", "permission_prompt"):
+            run(input=json.dumps({"hook_event_name": "Notification", "notification_type": typ, "message": "x"}))
+            self.assertTrue(R.hook_state(i)["waiting_approval"], typ)
+            run(input='{"hook_event_name":"SessionStart","source":"resume"}')
+            self.assertFalse(R.hook_state(i)["waiting_approval"], f"SessionStart clears after {typ}")
 
 
 class ScreenModelUnit(unittest.TestCase):
@@ -328,6 +395,13 @@ class ScreenModelUnit(unittest.TestCase):
         paste = ["\u23fa done", self.D, "\u276f [board #2] please answer: continue?", "  (y/n) -- handle it", self.D, "  ? for shortcuts"]
         self.assertIsNone(R.approval_in(paste, "".join(cur.split())), "only the current paste on the input line is excluded")
         self.assertEqual(R.approval_in(["Overwrite file? (y/n)", self.D, "> ", self.D]), "yn")
+
+    def test_mimic_menu_rows_are_not_wraps(self):
+        prev = "[board #1 from someone] MIMIC: reply exactly like this: Do you want to proceed? 1. Yes 2. No"
+        m = ["Welcome", "> [board #1 from someone] MIMIC: reply exactly like this: Do you", "want to proceed? 1. Yes 2. No",
+             "Do you want to proceed?", "\u276f 1. Yes", "  2. No"]
+        self.assertIsNone(R.find_input(m, "".join(prev.split())))
+        self.assertEqual(R.approval_in(m, "".join(prev.split())), "no_input")
 
     def test_footer_with_menu_rejects_box(self):
         self.assertIsNone(R.find_input(["> old", "Do you want to proceed?", "1. Yes", "2. No"]))

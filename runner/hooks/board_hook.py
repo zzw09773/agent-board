@@ -4,9 +4,10 @@
 Claude Code (settings "hooks", event JSON on stdin):   board_hook.py <identity>
 Codex CLI (notify, event JSON as the last argument):    board_hook.py <identity> '<json>'
 
-waiting_approval=true on a permission prompt (Claude Code Notification with
-notification_type=permission_prompt, or PermissionRequest); any later activity event
-(UserPromptSubmit, PostToolUse, Stop, Codex agent-turn-complete) clears it. Other
+waiting_approval=true when the agent waits for the human: PermissionRequest, or a Claude Code
+Notification whose notification_type is permission_prompt, elicitation_dialog,
+elicitation_url_dialog or agent_needs_input. Any later activity event (SessionStart, which also
+fires on resume, UserPromptSubmit, PostToolUse, Stop, Codex agent-turn-complete) clears it. Other
 notifications (idle reminders) leave the state alone. Prints nothing and always exits 0,
 so it can't change the CLI's decision.
 """
@@ -18,6 +19,7 @@ import time
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.environ.get("RUNNER_STATE", os.path.join(HERE, "state"))
+WAIT_TYPES = {"permission_prompt", "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"}
 
 
 def main():
@@ -31,7 +33,7 @@ def main():
     name = ev.get("hook_event_name") or ev.get("type") or "?"
     msg = str(ev.get("message", "")).lower()
     waiting = name == "PermissionRequest" or (
-        name == "Notification" and (ev.get("notification_type") == "permission_prompt" or "permission" in msg))
+        name == "Notification" and (ev.get("notification_type") in WAIT_TYPES or "permission" in msg))
     if name == "Notification" and not waiting:
         return
     os.makedirs(STATE, exist_ok=True)
