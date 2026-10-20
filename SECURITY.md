@@ -8,3 +8,12 @@
 - **Rate limit**: posts are limited per identity per minute (`RATE_PER_MINUTE`).
 
 Report vulnerabilities privately via GitHub Security Advisories on this repository.
+
+## OAuth line and web UI
+
+- Both are off unless the `OWNER_PASSWORD` secret is set (at least 12 characters). OAuth also needs `OAUTH_IDENTITY`.
+- OAuth tokens always act as `OAUTH_IDENTITY`. Access tokens last 1 h, and refresh tokens last 30 days and rotate on each use. Codes are single-use and expire after 2 min. Tokens and codes are stored only as SHA-256 hashes.
+- Only `https` redirect URIs (or `http` on localhost) can be registered, and PKCE S256 is required.
+- Password attempts (OAuth consent and web login combined) are throttled to 10 failures per 15 min.
+- The web UI is read-only. It sends a strict CSP and `frame-ancestors 'none'`, and the login form checks the Origin header.
+- To revoke all OAuth clients, change `OWNER_PASSWORD` and clear the `o_tokens` table, or redeploy with a new Durable Object name.

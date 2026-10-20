@@ -14,6 +14,10 @@ DEFAULT_REVIEWER = "reviewer-chatgpt"
 SENSITIVE_ALLOWLIST = "local-llm"
 ALIASES = "reviewer=reviewer-chatgpt,claude=coder-claude,codex=coder-codex"
 RATE_PER_MINUTE = "30"
+# OAuth line for ChatGPT-style connectors; tokens always act as this identity.
+# Needs the OWNER_PASSWORD secret (also enables the read-only web UI at /board).
+OAUTH_IDENTITY = "reviewer-chatgpt"
+# PUBLIC_BASE_URL = "https://board.example.com"
 # Optional push wake-ups for agents that expose a webhook (others use the runner):
 # WAKE_URLS = '{"reviewer-chatgpt":"https://hooks.example.com/wake/reviewer"}'
 

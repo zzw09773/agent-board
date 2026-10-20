@@ -5,6 +5,8 @@ import { DurableObject } from "cloudflare:workers";
 import { loadConfig, identify } from "./config.js";
 import { BOARD_TOOLS, boardCall, initBoard } from "./board.js";
 import { TASK_TOOLS, taskCall, initTasks } from "./tasks.js";
+import { initOAuth, handleOAuth, oauthIdentity, oauthEnabled, wwwAuth } from "./oauth.js";
+import { initWeb, handleWeb } from "./web.js";
 
 const MAX_BODY = 256 * 1024;
 const PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -15,7 +17,7 @@ export default {
   async fetch(req, env) {
     const p = new URL(req.url).pathname;
     if (p === "/health") return json({ ok: true });
-    if (p !== "/mcp") return json({ error: "not_found" }, 404);
+    if (p === "/") return Response.redirect(new URL("/board", req.url).toString(), 302);
     const len = parseInt(req.headers.get("content-length") || "0");
     if (len > MAX_BODY) return json({ error: "too_large" }, 413);
     const stub = env.BOARD.get(env.BOARD.idFromName("main"));
@@ -31,6 +33,8 @@ export class Board extends DurableObject {
     this.rl = {};
     initBoard(this.sql);
     initTasks(this.sql);
+    initOAuth(this.sql);
+    initWeb(this.sql);
   }
 
   rateOk(id, cfg) {
@@ -43,10 +47,17 @@ export class Board extends DurableObject {
 
   async fetch(req) {
     const cfg = loadConfig(this.env);
+    const base = (this.env.PUBLIC_BASE_URL || new URL(req.url).origin).replace(/\/$/, "");
+    const o = await handleOAuth(this, cfg, req, base);
+    if (o) return o;
+    const w = await handleWeb(this, cfg, req);
+    if (w) return w;
+    if (new URL(req.url).pathname !== "/mcp") return json({ error: "not_found" }, 404);
     let k = req.headers.get("authorization") || "";
     if (k.toLowerCase().startsWith("bearer ")) k = k.slice(7).trim();
-    const me = identify(cfg, this.env, k);
-    if (!me) return json({ error: "unauthorized" }, 401, { "WWW-Authenticate": "Bearer" });
+    // Per-identity keys first; otherwise an OAuth access token, which always maps to OAUTH_IDENTITY.
+    const me = identify(cfg, this.env, k) || (await oauthIdentity(this, cfg, k));
+    if (!me) return json({ error: "unauthorized" }, 401, { "WWW-Authenticate": oauthEnabled(cfg, this.env) ? wwwAuth(base) : "Bearer" });
     if (req.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
     let m;
     try { m = await req.json(); } catch { return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400); }
