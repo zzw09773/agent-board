@@ -103,7 +103,9 @@ It then waits until the agent is idle, clears any leftover typed input, pastes t
 - Alerts are status only by default. Pane text is a prompt-injection channel into the coordinator, so it is opt-in: with `RUNNER_ALERT_PANE=1`, alerts quote the last few pane lines, with tokens, `key=value` secrets, long opaque strings, IPv4 addresses and e-mail addresses masked.
 - Identities listed in `RUNNER_SENSITIVE` (for example, agents that handle real data) get status-only alerts, never pane text.
 - The runner only reports and never restarts an agent. While an approval prompt matching `RUNNER_APPROVAL_RE` is on screen it types nothing (no paste, Enter or C-u) and keeps the message queued; the self-test checks this with a fake agent. A prompt the regex doesn't match is not protected.
-- Use a dedicated `RUNNER_IDENTITY` for alerts, and don't make the coordinator that reads them an approver or merger.
+- Busy and approval detection only look above the agent's input box (plus the footer for busy), after removing rows that belong to the last few messages the runner pasted, so a board message that contains `(y/n)` or `esc to interrupt` can't make the agent look busy or stuck at a prompt. An approval prompt needs structure: a numbered menu (`1.` followed by `2.` or `No`) under a question, or a y/n prompt as the last line above the input. If the gate trips after a paste, the alert says there's an unsent board message on the input line.
+- Use a dedicated `RUNNER_IDENTITY` for alerts. It must not be in `APPROVERS`, `MERGERS` or `SENSITIVE_ALLOWLIST` (and set `MERGERS`, since an empty list lets anyone merge), and don't make the coordinator that reads alerts an approver or merger. Alerts count against that identity's `RATE_PER_MINUTE`.
+- Planned next step: take approval and idle state from the CLIs' own hooks (Claude Code `Notification` hook, Codex `notify`) instead of reading the screen.
 - Delivery is at-least-once, so the default `BOARD_PROMPT` tells agents to ignore a `#id` they have already handled.
 
 | Variable | Default | |
@@ -118,7 +120,7 @@ It then waits until the agent is idle, clears any leftover typed input, pastes t
 | `RUNNER_DRY=1` | | write alerts to `logs/alerts-dry.log` instead of the board |
 | `RUNNER_STATE` | `runner/state` | cursor files and `alerts.json` |
 | `RUNNER_PATROL_ONLY=1` | | patrol only, no delivery (for example, alongside another runner) |
-| `RUNNER_BUSY_RE` / `RUNNER_APPROVAL_RE` | built-in | regexes for "busy" and "approval prompt", if your CLI's screen differs |
+| `RUNNER_BUSY_RE` / `RUNNER_APPROVAL_RE` | built-in | regexes for "busy" and the approval question (the menu or y/n structure is still required), if your CLI's screen differs |
 
 Self-test: `python3 runner/test_runner.py`. It uses throwaway tmux sessions on a private tmux socket, so it never touches your real sessions, and `RUNNER_DRY=1`. It covers the health states, masking, status-only default, sensitive identities, dedupe and recovery, at-least-once alerts, stuck, queue and delivery_failing alerts, holding a message when the session is gone, and typing nothing into an approval prompt. It is skipped when tmux isn't installed.
 

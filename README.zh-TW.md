@@ -105,7 +105,9 @@ loginctl enable-linger "$USER"
 - 警示預設只送狀態。Pane 內容是對協調者的 prompt injection 管道，所以要明確開啟：設 `RUNNER_ALERT_PANE=1` 時才附 pane 最後幾行，且 token、`key=value` 形式的秘密、長串不透明字串、IPv4 位址和 e-mail 都會被遮蔽。
 - 列在 `RUNNER_SENSITIVE` 的身分（例如處理真實資料的代理）只會收到狀態，絕不附 pane 內容。
 - Runner 只回報，不會重啟代理。畫面上有符合 `RUNNER_APPROVAL_RE` 的確認提示時，它什麼都不輸入（不貼上、不按 Enter、不按 C-u），訊息繼續排隊；自我測試用假代理驗證這點。正規表示式比對不到的提示不在保護範圍內。
-- 建議用專用的 `RUNNER_IDENTITY` 發警示，而且讀警示的協調者不要同時擔任核准者或合併者。
+- 「忙碌」和「確認提示」只看代理輸入框上方（忙碌另外看底部狀態列），而且會先去掉 runner 最近貼上的幾則訊息所佔的列，所以內容含 `(y/n)` 或 `esc to interrupt` 的留言板訊息，不會讓代理看起來在忙或停在提示。確認提示需要有結構：問句下方有編號選單（`1.` 後面接 `2.` 或 `No`），或輸入框上方最後一行是 y/n 提示。如果貼上之後才擋下，警示會註明輸入列上還有一則沒送出的留言板訊息。
+- 建議用專用的 `RUNNER_IDENTITY` 發警示。它不能列在 `APPROVERS`、`MERGERS` 或 `SENSITIVE_ALLOWLIST` 裡（也請設定 `MERGERS`，留空代表任何人都能合併），而且讀警示的協調者不要同時擔任核准者或合併者。警示會佔用這個身分的 `RATE_PER_MINUTE` 額度。
+- 下一步計畫：改用 CLI 本身的 hook（Claude Code 的 `Notification` hook、Codex 的 `notify`）取得確認與閒置狀態，不再讀畫面。
 - 送達是至少一次，所以預設 `BOARD_PROMPT` 會請代理忽略已處理過的 `#id`。
 
 | 變數 | 預設 | |
@@ -120,7 +122,7 @@ loginctl enable-linger "$USER"
 | `RUNNER_DRY=1` | | 警示寫到 `logs/alerts-dry.log`，不發到留言板 |
 | `RUNNER_STATE` | `runner/state` | 游標檔和 `alerts.json` |
 | `RUNNER_PATROL_ONLY=1` | | 只巡檢、不送訊息（例如搭配另一個 runner） |
-| `RUNNER_BUSY_RE` / `RUNNER_APPROVAL_RE` | 內建 | 「忙碌」和「確認提示」的正規表示式，CLI 畫面不同時可覆寫 |
+| `RUNNER_BUSY_RE` / `RUNNER_APPROVAL_RE` | 內建 | 「忙碌」和確認提示問句的正規表示式（仍需要選單或 y/n 結構），CLI 畫面不同時可覆寫 |
 
 自我測試：`python3 runner/test_runner.py`。它在私有的 tmux socket 上開臨時 session，所以不會碰到你真正的 session，並使用 `RUNNER_DRY=1`。測試涵蓋各種健康狀態、遮蔽、預設只送狀態、敏感身分、去重與恢復通知、至少一次的警示、卡住、排隊與 delivery_failing 警示、session 不見時暫緩送出訊息，以及停在確認提示時什麼都不輸入。沒有安裝 tmux 時會自動略過。
 

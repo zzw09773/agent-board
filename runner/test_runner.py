@@ -53,6 +53,30 @@ def alerts():
         return {}
 
 
+# A minimal Claude-Code-like CLI: transcript, bordered input line, footer; submitted lines go to argv[1].
+FAKE_CLI = r"""
+import os, sys, tty, textwrap
+rec = sys.argv[1]; open(rec, "w").close()
+T = ["Welcome"]; buf = ""
+def draw():
+    out = "\x1b[2J\x1b[H" + "\r\n".join(T[-30:]) + "\r\n\r\n" + "\u2500" * 60 + "\r\n\u276f " + buf + "\r\n" + "\u2500" * 60 + "\r\n  ? for shortcuts"
+    os.write(1, out.encode())
+tty.setraw(0); draw()
+while True:
+    d = os.read(0, 4096).decode("utf-8", "replace").replace("\x1b[200~", "").replace("\x1b[201~", "")
+    for ch in d:
+        if ch == "\r":
+            if buf:
+                T.extend(textwrap.wrap("> " + buf, 70)); T.append("\u23fa ok, handled")
+                open(rec, "a").write(buf + "\n"); buf = ""
+        elif ch == "\x15":
+            buf = ""
+        elif ch >= " ":
+            buf += ch
+    draw()
+"""
+
+
 @unittest.skipUnless(HAVE_TMUX, "tmux not installed")
 class RunnerSelfTest(unittest.TestCase):
     @classmethod
@@ -165,6 +189,31 @@ class RunnerSelfTest(unittest.TestCase):
         self.assertIn(f"{i}|awaiting_approval", alerts())
         R.QUEUED.pop(i, None)
         R.AGENT_PROCS.discard(os.path.basename(exe))
+
+    def test_message_text_is_not_a_prompt(self):
+        """Regression: board messages containing '(y/n)' or 'esc to interrupt' must not jam delivery."""
+        i = PFX + "-cli"
+        rec = os.path.join(TMP, "cli.rec")
+        fake = os.path.join(TMP, "fake_cli.py")
+        open(fake, "w").write(FAKE_CLI)
+        exe = os.path.realpath(sys.executable)
+        names = {os.path.basename(exe), os.path.basename(sys.executable), "python3", "python"}
+        R.AGENT_PROCS.update(names)
+        try:
+            start(i, f"{exe} {fake} {rec}")
+            time.sleep(0.8)
+            msgs = [(11, "normal message one"), (12, "please answer: continue? (y/n)"),
+                    (13, "the spinner said Working (esc to interrupt) earlier, ignore it"), (14, "normal message two")]
+            for mid, text in msgs:
+                self.assertIs(R.deliver(i, {"id": mid, "from": "someone", "to": i, "text": text}), True, f"#{mid}")
+                h = R.health(i)
+                self.assertIsNone(h["problem"], f"after #{mid}")
+                self.assertFalse(h["busy"], f"after #{mid}")
+            got = open(rec).read()
+            for mid, _ in msgs:
+                self.assertEqual(got.count(f"[board #{mid} "), 1, f"#{mid} submitted exactly once")
+        finally:
+            R.AGENT_PROCS.difference_update(names - {"sleep"})
 
     def test_alert_at_least_once(self):
         i = PFX + "-flaky"

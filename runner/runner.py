@@ -89,10 +89,17 @@ PROMPT = env(
 )
 # Screen patterns of common agent CLIs. Override with RUNNER_BUSY_RE / RUNNER_APPROVAL_RE if yours differ.
 BUSY = re.compile(env("RUNNER_BUSY_RE", r"esc to interrupt|esc to cancel|• Working|Working \(|Thinking…|✻ \w+ing…|\(esc to"))
-APPROVAL = re.compile(env("RUNNER_APPROVAL_RE",
-    r"Do you want to (?:proceed|make this edit|create|run)|Allow (?:command|this)|Would you like to (?:run|make|apply)"
-    r"|❯ 1\. Yes|Yes, (?:proceed|and don't ask)|Press enter to confirm|approve this|\(y/n\)|\[y/N\]"), re.I)
+# Approval prompts are matched only above the input box and need structure: a numbered menu
+# ("1. ..." followed by "2. ..." or "No") under a question, or a y/n prompt as the last line.
+# RUNNER_APPROVAL_RE overrides the question pattern.
+QUESTION = re.compile(env("RUNNER_APPROVAL_RE",
+    r"Do you want to|Allow (?:command|this)|Would you like to|approve|Proceed\?|Press enter to confirm"), re.I)
+OPT1 = re.compile(r"^\s*(?:│\s*)?[›❯>]?\s*1\.\s+\S")
+OPT2 = re.compile(r"^\s*(?:│\s*)?[›❯>]?\s*(?:2\.\s+\S|No\b)", re.I)
+YN = re.compile(r"(?:\(y/n\)|\[y/N\]|\[Y/n\]|\(yes/no\))\s*[:?]?\s*$", re.I)
 INPUT = re.compile(r"^\s*(?:│\s*)?[›❯>]\s?(.*)$")  # the agent's input line
+MENU = re.compile(r"^\s*(?:│\s*)?[›❯>]\s*\d+\.\s")  # "❯ 1. Yes" is a menu cursor, not the input line
+BORDER = re.compile(r"^\s*[─━═╭╰└┌][─━═]{3,}|^\s*[╰└][─━═]")
 # Masking for pane text quoted in alerts: tokens, key=value secrets, long opaque strings, IPv4, e-mail.
 SECRET = re.compile(r"(?:sk|pk|ghp|gho|ghs|github_pat|xox[abp]|AKIA)[-_A-Za-z0-9]{12,}|Bearer\s+\S+"
                     r"|(?:key|token|secret|password|passwd)\s*[=:]\s*\S+|\b[A-Za-z0-9+/_-]{32,}\b"
@@ -172,8 +179,61 @@ def tail(s, n):
     return "\n".join(rows(s)[-n:])
 
 
+# ---------- screen model ----------
+RECENT = {}  # session -> the last few payloads the runner pasted, whitespace removed
+
+
+def remember(s, payload):
+    r = RECENT.setdefault(s, [])
+    r.append("".join(payload.split()))
+    del r[:-5]
+
+
+def _bare(x):
+    return x.strip().strip("│").strip().lstrip("›❯>•⏺ ").strip()
+
+
+def regions(s):
+    """(above, footer): rows above the agent's input box and rows below its bottom border.
+    The input line and its wrapped continuation are excluded, and rows that are part of a
+    payload the runner recently pasted (compared with all whitespace removed, so collapsing
+    and wrapping don't matter) are dropped, so the runner's own text can't look like a
+    prompt or a busy spinner."""
+    lines = rows(s)
+    k = None
+    for n in range(len(lines) - 1, max(-1, len(lines) - 30), -1):
+        if INPUT.match(lines[n]) and not MENU.match(lines[n]):
+            k = n
+            break
+    if k is None:
+        above, footer = lines, []
+    else:
+        top = k - 1 if k > 0 and BORDER.match(lines[k - 1]) else k
+        end = next((n for n in range(k + 1, len(lines)) if BORDER.match(lines[n])), None)
+        above, footer = lines[:top], (lines[end + 1:] if end is not None else [])
+    rec = RECENT.get(s, [])
+
+    def mine(x):
+        t = "".join(_bare(x).split())
+        return len(t) >= 3 and any(t in r for r in rec)
+    return [x for x in above if not mine(x)], [x for x in footer if not mine(x)]
+
+
+def approval_on(s):
+    above = [x for x in regions(s)[0] if x.strip()][-15:]
+    if not above:
+        return False
+    if YN.search(_bare(above[-1])):  # a real y/n prompt as the last line above the input
+        return True
+    ones = [n for n, x in enumerate(above) if OPT1.match(x)]
+    if ones and any(OPT2.match(x) for x in above[ones[-1] + 1:]):  # numbered menu: 1. then 2. / No
+        return any(QUESTION.search(x) for x in above[:ones[-1] + 1]) or any(MENU.match(x) for x in above)
+    return False
+
+
 def busy(s):
-    return bool(BUSY.search(tail(s, 12)))
+    above, footer = regions(s)
+    return bool(BUSY.search("\n".join([x for x in above if x.strip()][-12:] + footer)))
 
 
 def inputline(s):
@@ -218,7 +278,7 @@ def health(i):
     kids = children(pid) if pid.isdigit() else []
     if dead == "1" or not (cmd in AGENT_PROCS or AGENT_PROCS.intersection(kids)):
         return {"problem": "process_dead", "detail": f"pane is running {cmd or '?'}, no agent process"}
-    if APPROVAL.search(tail(s, 25)):
+    if approval_on(s):
         return {"problem": "awaiting_approval", "detail": "waiting at a confirmation prompt"}
     return {"problem": None, "busy": busy(s)}
 
@@ -366,10 +426,12 @@ def patrol(ids):
 FAILS = {}  # identity -> [message id, consecutive failed delivery attempts]
 
 
-def gate(i, m):
+def gate(i, m, pasted=False):
     """True when nothing may be typed: an approval prompt (or an outage) is on screen."""
     st = health(i)
     if st["problem"]:
+        if pasted:
+            st = dict(st, detail=(st.get("detail") or "") + f"; there's an unsent board message (#{m['id']}) on the input line")
         QUEUED.setdefault(i, time.time())
         alert(i, st["problem"], st)
         log(i, f"gate: {st['problem']}; #{m['id']} queued, nothing typed")
@@ -438,6 +500,7 @@ def deliver(i, m):
         return None
     before = inputline(s)
     b = "runner-" + i
+    remember(s, p)
     r = subprocess.run([*TMUX, "load-buffer", "-b", b, "-"], input=p, capture_output=True, text=True)
     if r.returncode:
         log(i, f"error load-buffer #{m['id']}: {r.stderr.strip()}")
@@ -460,7 +523,7 @@ def deliver(i, m):
         return False
     time.sleep(1.0)
     for attempt in (1, 2):
-        if gate(i, m):  # never press anything (not even C-u) into an approval prompt
+        if gate(i, m, pasted=True):  # never press anything (not even C-u) into an approval prompt
             return None
         r = tmux("send-keys", "-t", "=" + s + ":", "Enter")
         if r.returncode:
