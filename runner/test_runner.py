@@ -347,6 +347,25 @@ class RunnerSelfTest(unittest.TestCase):
             R.HOOK_TTL = old
             R.HOOK_CLEAN.pop(i, None)
 
+    def test_unit_ttl_new_hook_event_restarts_ttl(self):
+        i = PFX + "-ttl2"
+        self._cli(i, os.path.join(TMP, "ttl2.rec"))
+        os.makedirs(R.STATE, exist_ok=True)
+        path = os.path.join(R.STATE, f"{i}.hook.json")
+        with open(path, "w") as f:
+            json.dump({"waiting_approval": True, "ts": 1.0, "event": "Notification"}, f)
+        old = R.HOOK_TTL
+        try:
+            R.HOOK_TTL = 60
+            R.HOOK_CLEAN[i] = (1.0, time.time() - 3600)
+            self.assertTrue(R.health(i).get("hook_stale"), "the old hook is past the TTL")
+            with open(path, "w") as f:
+                json.dump({"waiting_approval": True, "ts": time.time(), "event": "PermissionRequest"}, f)
+            self.assertEqual(R.health(i)["problem"], "awaiting_approval", "a fresh hook event within the TTL is not cleared")
+        finally:
+            R.HOOK_TTL = old
+            R.HOOK_CLEAN.pop(i, None)
+
     def test_hook_state(self):
         i = PFX + "-hook"
         self._cli(i, os.path.join(TMP, "hook.rec"))

@@ -335,7 +335,10 @@ def health(i):
     why = approval_on(s)
     if h and h.get("waiting_approval"):
         if why is None:  # the screen shows a valid bottom input box and no menu
-            t0 = HOOK_CLEAN.setdefault(i, time.time())
+            c = HOOK_CLEAN.get(i)
+            if not c or c[0] != h.get("ts"):  # a newer hook event restarts the TTL
+                c = HOOK_CLEAN[i] = (h.get("ts"), time.time())
+            t0 = c[1]
             if time.time() - t0 > HOOK_TTL:
                 if HOOK_STALE_LOGGED.get(i) != h.get("ts"):
                     HOOK_STALE_LOGGED[i] = h.get("ts")
