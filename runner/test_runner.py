@@ -151,7 +151,10 @@ class RunnerSelfTest(unittest.TestCase):
             "import os,sys,tty\nrec=sys.argv[1]; open(rec,'wb').close()\n"
             "print('Bash command\\n  rm -rf ./build\\nDo you want to proceed?\\n\u276f 1. Yes\\n  2. No', flush=True)\n"
             "tty.setraw(0)\nwhile True:\n    b=os.read(0,1024)\n    open(rec,'ab').write(b)\n")
-        start(i, f"bash -c 'exec -a sleep python3 {fake} {rec}'")  # exec -a is a bash builtin; /bin/sh may be dash
+        # run the fake under its real name (renaming argv[0] breaks some Python installs) and count it as the agent
+        exe = os.path.realpath(sys.executable)
+        R.AGENT_PROCS.add(os.path.basename(exe))
+        start(i, f"{exe} {fake} {rec}")
         time.sleep(0.8)
         self.assertEqual(R.health(i)["problem"], "awaiting_approval")
         ok = R.deliver(i, {"id": 7, "from": "someone", "to": i, "text": "please run it"})
@@ -161,6 +164,7 @@ class RunnerSelfTest(unittest.TestCase):
         self.assertIn(i, R.QUEUED, "queued like busy")
         self.assertIn(f"{i}|awaiting_approval", alerts())
         R.QUEUED.pop(i, None)
+        R.AGENT_PROCS.discard(os.path.basename(exe))
 
     def test_alert_at_least_once(self):
         i = PFX + "-flaky"
