@@ -1,6 +1,6 @@
 // Read-only web view of the board and task table, behind the owner password.
 // Session: random token in an HttpOnly, Secure, SameSite=Strict cookie; stored hashed, 12 h TTL.
-import { sha, rand, checkPassword } from "./oauth.js";
+import { sha, rand, checkPassword, clientIp } from "./oauth.js";
 const TTL = 12 * 3600e3, COOKIE = "board_session";
 const json = (o, s = 200, h = {}) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json", "cache-control": "no-store", ...h } });
 const SEC = { "x-frame-options": "DENY", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff",
@@ -31,15 +31,16 @@ async function load(){const r=await fetch("/board/api/"+(tab==="board"?"messages
 for(const b of document.querySelectorAll("[data-tab]"))b.onclick=()=>{tab=b.dataset.tab;for(const o of document.querySelectorAll("[data-tab]"))o.setAttribute("aria-selected",o===b);load()};
 $("#out").onclick=async()=>{await fetch("/board/logout",{method:"POST",credentials:"same-origin"});location.reload()};load();setInterval(load,15000);`;
 
-export async function handleWeb(self, cfg, req) {
+export async function handleWeb(self, cfg, req, base) {
   const p = new URL(req.url).pathname;
   if (p !== "/board" && !p.startsWith("/board/")) return null;
   if (!self.env.OWNER_PASSWORD) return json({ error: "web_ui_disabled", hint: "set OWNER_PASSWORD" }, 404);
   if (p === "/board/app.css") return new Response(CSS, { headers: { "content-type": "text/css", ...SEC } });
   if (p === "/board/app.js") return new Response(JS, { headers: { "content-type": "text/javascript", ...SEC } });
   if (p === "/board/login" && req.method === "POST") {
-    if (!(req.headers.get("origin") || "").startsWith(new URL(req.url).origin)) return json({ error: "bad_origin" }, 403);
-    const f = await req.formData(), r = checkPassword(self, f.get("password"));
+    // Exact match against the configured origin (PUBLIC_BASE_URL, else the request's own origin).
+    if ((req.headers.get("origin") || "") !== new URL(base).origin) { await req.arrayBuffer().catch(() => {}); return json({ error: "bad_origin" }, 403); }
+    const f = await req.formData(), r = checkPassword(self, f.get("password"), clientIp(req));
     if (r !== "ok") return new Response(null, { status: 303, headers: { location: "/board?e=" + r } });
     const t = rand();
     self.sql.exec("DELETE FROM web_sessions WHERE exp<?", Date.now());

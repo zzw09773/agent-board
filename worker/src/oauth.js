@@ -14,17 +14,25 @@ export function initOAuth(sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS o_clients(client_id TEXT PRIMARY KEY, redirect_uris TEXT, name TEXT, created INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS o_codes(h TEXT PRIMARY KEY, client_id TEXT, redirect_uri TEXT, challenge TEXT, exp INTEGER)");
   sql.exec("CREATE TABLE IF NOT EXISTS o_tokens(h TEXT PRIMARY KEY, kind TEXT, client_id TEXT, exp INTEGER)");
-  sql.exec("CREATE TABLE IF NOT EXISTS auth_fail(t INTEGER)");
+  try { sql.exec("ALTER TABLE o_tokens ADD COLUMN family TEXT"); } catch { /* already there */ }
+  sql.exec("CREATE TABLE IF NOT EXISTS auth_fail_ip(ip TEXT, t INTEGER)");
+  sql.exec("CREATE INDEX IF NOT EXISTS auth_fail_ip_i ON auth_fail_ip(ip, t)");
 }
 
-// Shared password check with a global failure throttle (10 failures / 15 min).
+// Password check with a per-source throttle (keyed by CF-Connecting-IP), so a flood of
+// bad guesses from one address can't lock the owner out everywhere.
+// Backoff: after FREE failures within 24 h, that source must wait 1 min, then 2, 4, ... capped at 1 h.
+const FREE = 5, DAY = 86400e3, MAX_WAIT = 3600e3;
+export const clientIp = (req) => req.headers.get("cf-connecting-ip") || "unknown";
 export function eq(a, b) { a = String(a); b = String(b); let r = a.length ^ b.length; for (let i = 0; i < Math.max(a.length, b.length); i++) r |= (a.charCodeAt(i) | 0) ^ (b.charCodeAt(i) | 0); return r === 0; }
-export function checkPassword(self, pw) {
+export function checkPassword(self, pw, ip) {
   const t = Date.now();
-  self.sql.exec("DELETE FROM auth_fail WHERE t<?", t - 900e3);
-  if (self.sql.exec("SELECT COUNT(*) c FROM auth_fail").one().c >= 10) return "locked";
+  self.sql.exec("DELETE FROM auth_fail_ip WHERE t<?", t - DAY);
+  const r = self.sql.exec("SELECT COUNT(*) c, MAX(t) last FROM auth_fail_ip WHERE ip=?", ip).one();
+  if (r.c >= FREE && t < r.last + Math.min(60e3 * 2 ** (r.c - FREE), MAX_WAIT)) return "locked";
   const ok = !!self.env.OWNER_PASSWORD && String(self.env.OWNER_PASSWORD).length >= 12 && eq(pw || "", self.env.OWNER_PASSWORD);
-  if (!ok) self.sql.exec("INSERT INTO auth_fail VALUES(?)", t);
+  if (ok) self.sql.exec("DELETE FROM auth_fail_ip WHERE ip=?", ip);
+  else self.sql.exec("INSERT INTO auth_fail_ip VALUES(?,?)", ip, t);
   return ok ? "ok" : "bad";
 }
 
@@ -78,7 +86,7 @@ export async function handleOAuth(self, cfg, req, base) {
     const hidden = ["client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method", "state", "scope", "resource"].map((k) => q[k] != null ? `<input type=hidden name=${k} value="${esc(q[k])}">` : "").join("");
     const form = (err) => page("Authorize", `<h2>${esc(cfg.boardName)}</h2><p><b>${esc(c.name)}</b> wants to use the board as <b>${esc(cfg.oauthIdentity)}</b>.</p>${err ? `<p class=e>${err}</p>` : ""}<form method=post>${hidden}<input type=password name=password placeholder="Owner password" autocomplete=current-password required autofocus><button>Allow</button></form>`);
     if (req.method !== "POST") return form("");
-    const r = checkPassword(self, q.password);
+    const r = checkPassword(self, q.password, clientIp(req));
     if (r !== "ok") return form(r === "locked" ? "Too many attempts; try again later." : "Wrong password.");
     const code = rand();
     self.sql.exec("INSERT INTO o_codes VALUES(?,?,?,?,?)", await sha(code), c.client_id, q.redirect_uri, q.code_challenge, Date.now() + CODE_TTL);
@@ -88,11 +96,12 @@ export async function handleOAuth(self, cfg, req, base) {
 
   if (p === "/oauth/token" && req.method === "POST") {
     const f = Object.fromEntries(await req.formData());
-    const issue = async (cid) => {
+    // Every token chain started by one authorization code is a "family" (RFC 9700 §4.14).
+    const issue = async (cid, family) => {
       const at = rand(), rt = rand(), n = Date.now();
       self.sql.exec("DELETE FROM o_tokens WHERE exp<?", n);
-      self.sql.exec("INSERT INTO o_tokens VALUES(?,?,?,?)", await sha(at), "access", cid, n + ACCESS_TTL);
-      self.sql.exec("INSERT INTO o_tokens VALUES(?,?,?,?)", await sha(rt), "refresh", cid, n + REFRESH_TTL);
+      self.sql.exec("INSERT INTO o_tokens(h,kind,client_id,exp,family) VALUES(?,?,?,?,?)", await sha(at), "access", cid, n + ACCESS_TTL, family);
+      self.sql.exec("INSERT INTO o_tokens(h,kind,client_id,exp,family) VALUES(?,?,?,?,?)", await sha(rt), "refresh", cid, n + REFRESH_TTL, family);
       return json({ access_token: at, token_type: "Bearer", expires_in: ACCESS_TTL / 1000, refresh_token: rt });
     };
     if (f.grant_type === "authorization_code") {
@@ -101,13 +110,20 @@ export async function handleOAuth(self, cfg, req, base) {
       if (!r || r.exp < Date.now() || r.client_id !== f.client_id || r.redirect_uri !== f.redirect_uri) return json({ error: "invalid_grant" }, 400);
       const ch = b64u(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(f.code_verifier || ""))));
       if (!eq(ch, r.challenge)) return json({ error: "invalid_grant", error_description: "PKCE mismatch" }, 400);
-      return issue(r.client_id);
+      return issue(r.client_id, rand(16));
     }
     if (f.grant_type === "refresh_token") {
-      const rows = self.sql.exec("DELETE FROM o_tokens WHERE h=? AND kind='refresh' RETURNING *", await sha(String(f.refresh_token || ""))).toArray(); // rotate
-      const r = rows[0];
+      const h = await sha(String(f.refresh_token || ""));
+      const r = self.sql.exec("SELECT * FROM o_tokens WHERE h=? AND kind IN ('refresh','refresh_used')", h).toArray()[0];
+      if (r && r.kind === "refresh_used") {
+        // Replay of an already-rotated refresh token: assume theft and revoke the whole family.
+        if (r.family) self.sql.exec("DELETE FROM o_tokens WHERE family=?", r.family);
+        else self.sql.exec("DELETE FROM o_tokens WHERE h=?", h);
+        return json({ error: "invalid_grant", error_description: "refresh token reuse detected; session revoked" }, 400);
+      }
       if (!r || r.exp < Date.now() || (f.client_id && f.client_id !== r.client_id)) return json({ error: "invalid_grant" }, 400);
-      return issue(r.client_id);
+      self.sql.exec("UPDATE o_tokens SET kind='refresh_used' WHERE h=?", h); // rotate; keep a tombstone to detect replay
+      return issue(r.client_id, r.family || rand(16));
     }
     return json({ error: "unsupported_grant_type" }, 400);
   }

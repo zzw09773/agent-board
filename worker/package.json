@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "wrangler deploy --dry-run --outdir dist"
+    "check": "wrangler deploy --dry-run --outdir dist",
+    "test": "node --test --test-concurrency=1 test/run.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.86.0"

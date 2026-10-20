@@ -2,6 +2,18 @@ import { canon } from "./config.js";
 
 export function initBoard(sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS board(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, to_name TEXT, from_name TEXT, text TEXT)");
+  sql.exec("CREATE TABLE IF NOT EXISTS post_rl(who TEXT, t INTEGER)");
+  sql.exec("CREATE INDEX IF NOT EXISTS post_rl_who ON post_rl(who, t)");
+}
+
+// Per-identity post rate limit, persisted in Durable Object storage so it survives restarts.
+// Counts every post an identity causes, including task hand-off notifications.
+export function rateOk(self, cfg, who) {
+  const t = Date.now();
+  self.sql.exec("DELETE FROM post_rl WHERE t<?", t - 60000);
+  if (self.sql.exec("SELECT COUNT(*) c FROM post_rl WHERE who=?", who).one().c >= cfg.ratePerMinute) return false;
+  self.sql.exec("INSERT INTO post_rl VALUES(?,?)", who, t);
+  return true;
 }
 
 const ro = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
@@ -49,6 +61,7 @@ export async function post(self, cfg, from, toRaw, text) {
   if (!to) throw new Error("to must be one of " + cfg.identities.join(", "));
   if (typeof text !== "string" || !text.trim()) throw new Error("text is required");
   if (text.length > cfg.maxPostChars) throw new Error("text too long");
+  if (!rateOk(self, cfg, from)) { const e = new Error("rate_limited"); e.rateLimited = true; throw e; }
   self.sql.exec("INSERT INTO board(created_at,to_name,from_name,text) VALUES(?,?,?,?)", new Date().toISOString(), to, from, text);
   const id = self.sql.exec("SELECT last_insert_rowid() i").one().i;
   for (const f of self.waiters) f();
@@ -59,7 +72,10 @@ export async function post(self, cfg, from, toRaw, text) {
 }
 
 export async function boardCall(self, cfg, me, name, a) {
-  if (name === "board_post") return post(self, cfg, me, a.to, a.text);
+  if (name === "board_post") {
+    try { return await post(self, cfg, me, a.to, a.text); }
+    catch (e) { if (e.rateLimited) return { error: "rate_limited", retry_after_seconds: 60 }; throw e; }
+  }
   if (name === "board_read") {
     const l = Math.max(1, Math.min(parseInt(a.limit) || 20, 100));
     return { messages: query(self, me, a.since_id, !!a.only_to_me, l, false) };

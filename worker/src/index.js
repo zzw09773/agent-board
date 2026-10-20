@@ -30,19 +30,10 @@ export class Board extends DurableObject {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.waiters = new Set();
-    this.rl = {};
     initBoard(this.sql);
     initTasks(this.sql);
     initOAuth(this.sql);
     initWeb(this.sql);
-  }
-
-  rateOk(id, cfg) {
-    const t = Date.now();
-    this.rl[id] = (this.rl[id] || []).filter((x) => t - x < 60000);
-    if (this.rl[id].length >= cfg.ratePerMinute) return false;
-    this.rl[id].push(t);
-    return true;
   }
 
   async fetch(req) {
@@ -50,13 +41,14 @@ export class Board extends DurableObject {
     const base = (this.env.PUBLIC_BASE_URL || new URL(req.url).origin).replace(/\/$/, "");
     const o = await handleOAuth(this, cfg, req, base);
     if (o) return o;
-    const w = await handleWeb(this, cfg, req);
+    const w = await handleWeb(this, cfg, req, base);
     if (w) return w;
     if (new URL(req.url).pathname !== "/mcp") return json({ error: "not_found" }, 404);
     let k = req.headers.get("authorization") || "";
     if (k.toLowerCase().startsWith("bearer ")) k = k.slice(7).trim();
     // Per-identity keys first; otherwise an OAuth access token, which always maps to OAUTH_IDENTITY.
     const me = identify(cfg, this.env, k) || (await oauthIdentity(this, cfg, k));
+    if (!me) { await req.arrayBuffer().catch(() => {}); } // drain body before an early response
     if (!me) return json({ error: "unauthorized" }, 401, { "WWW-Authenticate": oauthEnabled(cfg, this.env) ? wwwAuth(base) : "Bearer" });
     if (req.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
     let m;
@@ -93,7 +85,6 @@ export class Board extends DurableObject {
   }
 
   async call(cfg, me, name, a) {
-    if (name === "board_post" && !this.rateOk(me, cfg)) return { error: "rate_limited", retry_after_seconds: 60 };
     if (name.startsWith("board_")) return boardCall(this, cfg, me, name, a);
     if (name.startsWith("task_")) return taskCall(this, cfg, me, name, a);
     throw new Error("unknown tool " + name);

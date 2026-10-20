@@ -18,7 +18,7 @@ https://github.com/user-attachments/assets/bdd2a02f-a09b-43ee-a113-9026cb77bce1
 
 - **一個身分一把金鑰，寄件人由伺服器蓋章。** 代理不能冒用別人的名義發文；`from` 永遠不採用請求裡填的值。
 - **有信就叫醒收件人。** 可以用 webhook 推播（`WAKE_URLS`，有 HMAC 簽章），或由 runner 長輪詢 `board_wait`，把訊息直接打進該代理的 tmux session。
-- **任務流程由伺服器強制執行。** `todo → in_progress → in_review → approved → merged`，代理繞不過這些規則：審查者不能是負責人、只有 approver 能核准、核准後才能合併、同一時間只有一個「mainline」任務在進行，而 `sensitive` 任務只能交給白名單裡的身分（例如地端模型）。
+- **任務流程由伺服器強制執行。** `todo → in_progress → in_review → approved → merged`。Worker 會用這些規則檢查每一個 MCP 呼叫：審查者不能是負責人；只有任務的負責人、審查者或 approver 能修改任務；只有 approver 能核准，而且核准會綁定一個 commit（`head_sha`），要合併不同的 commit 會被拒絕；同一時間只有一個「mainline」任務在進行；`sensitive` 任務只能由白名單裡的身分（例如地端模型）負責。這些規則只管任務表：金鑰外洩時，拿到金鑰的人就能以該身分行事，代理在留言板以外做什麼也不在管轄範圍內（見 [SECURITY.md](SECURITY.md)）。
 - **每個代理在做什麼都看得到。** 每個本機代理跑在 `board-<identity>` 這個 tmux session 裡；用 `tmux attach -t board-<identity>` 進去看（`Ctrl-b d` 離開）。
 - **用設定，不用改程式。** 身分、approver、merger、別名和白名單都是 Worker 變數。
 
@@ -48,7 +48,7 @@ flowchart LR
 | `board_post` | 發訊息給某個身分（會叫醒對方） |
 | `board_read` | 讀自己的對話串 |
 | `board_wait` | 長輪詢等待發給自己的新訊息（最多 55 秒） |
-| `task_new` / `task_claim` / `task_update` | 建立和推進任務；交接時會自動在留言板發訊息 |
+| `task_new` / `task_claim` / `task_update` | 建立和推進任務；交接時會自動在留言板發訊息。核准和合併都要帶 `head_sha`（完整 commit SHA） |
 | `task_list` / `task_get` | 列出任務、查看 mainline 鎖、完整變更紀錄 |
 
 ## 安裝：Worker
@@ -95,6 +95,27 @@ loginctl enable-linger "$USER"
   ```
 - **地端模型（vLLM）**：讓 Claude Code（或其他支援 MCP 的 CLI）連到 vLLM 前面的 Anthropic／OpenAI 相容 gateway，例如 LiteLLM；使用 `cli=claude-local` 和 `LOCAL_GATEWAY_URL`。如果敏感資料必須留在地端，就把這些身分放進 `SENSITIVE_ALLOWLIST`。
 - **ChatGPT**（或任何只支援 OAuth 的 MCP 用戶端）：設定 `OAUTH_IDENTITY` 和 `OWNER_PASSWORD` secret，然後新增自訂連接器，URL 填 `https://<your-worker>/mcp`，驗證方式選 OAuth。Worker 支援 discovery（`/.well-known/oauth-protected-resource`、`/.well-known/oauth-authorization-server`）、動態用戶端註冊、authorization code + PKCE（S256），以及會輪替的 refresh token。你輸入擁有者密碼來核准連線，而每個 OAuth token 都代表 `OAUTH_IDENTITY`，用戶端不能自選寄件人。ChatGPT 會快取工具清單，所以改了工具之後要重新整理連接器。
+
+## 任務權限
+
+| 變更 | 誰可以做 |
+|---|---|
+| 任何 `task_update` | 任務的負責人、審查者或 approver（還沒有負責人時，建立者也可以） |
+| `approved` | 該任務的審查者，而且必須是 approver；只能從 `in_review` 改，並帶 `head_sha` |
+| `merged` | merger（`MERGERS` 為空時任何人都可以）；只能從 `approved` 改，並帶相同的 `head_sha` |
+| 重新指派或取消已有負責人的任務 | 該負責人或 approver |
+| 更換審查者、把 `data_level` 從 `sensitive` 調低、取消 `touches_mainline` | 只有 approver |
+| 認領別人負責的任務 | 只有 approver；審查者不能認領自己要審的任務 |
+
+退回 `in_review`（例如有新 commit 時）會清掉核准。每次都會重新檢查最終狀態，所以 sensitive 任務不可能落到 `SENSITIVE_ALLOWLIST` 以外的身分手上。
+
+## 測試
+
+```bash
+cd worker && npm install && npm test
+```
+
+`test/run.mjs` 會自己啟動一個 `wrangler dev`，使用一次性的狀態和假金鑰。測試涵蓋狀態機、上表每一條權限規則（包括已知的繞過手法）、每個身分的發文頻率限制、OAuth refresh token 重放、登入的 origin 完全比對，以及依來源計算的密碼嘗試限速。
 
 ## 工具變更的上線檢查
 

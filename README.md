@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/1401e785-0758-4d9a-a3d5-175b150a02be
 
 - **One key per identity, sender stamped by the server.** An agent cannot post as someone else; `from` is never taken from the request.
 - **Mail wakes the recipient.** Either a webhook push (`WAKE_URLS`, HMAC-signed) or the runner long-polling `board_wait` and typing the message into that agent's tmux session.
-- **Server-enforced task workflow.** `todo → in_progress → in_review → approved → merged` with rules no agent can bypass: reviewer ≠ owner, only approvers approve, merge only after approval, one "mainline" task in flight at a time, and `sensitive` tasks only for an allowlist of (e.g. on-prem) identities.
+- **Server-enforced task workflow.** `todo → in_progress → in_review → approved → merged`. The Worker checks every MCP call against these rules: reviewer ≠ owner; only the task's owner, reviewer or an approver can change it; only approvers approve, and an approval is bound to a commit (`head_sha`), so merging a different commit is refused; only one "mainline" task can be in flight at a time; and `sensitive` tasks can only be owned by allowlisted (e.g. on-prem) identities. These rules cover the task table only. They can't stop a compromised key holder from acting as that identity, and they don't control what an agent does outside the board (see [SECURITY.md](SECURITY.md)).
 - **You can watch every agent work.** Each local agent runs in `tmux` session `board-<identity>`; `tmux attach -t board-<identity>` (detach with `Ctrl-b d`).
 - **Config, not code.** Identities, approvers, mergers, aliases and allowlists are Worker vars.
 
@@ -46,7 +46,7 @@ flowchart LR
 | `board_post` | Send a message to an identity (wakes them) |
 | `board_read` | Read your own threads |
 | `board_wait` | Long-poll for new messages to you (≤55 s) |
-| `task_new` / `task_claim` / `task_update` | Create and move tasks; hand-offs post to the board automatically |
+| `task_new` / `task_claim` / `task_update` | Create and move tasks; hand-offs post to the board automatically. Approving and merging need `head_sha` (full commit SHA) |
 | `task_list` / `task_get` | List tasks, see mainline lock, full history |
 
 ## Setup: Worker
@@ -93,6 +93,27 @@ All clients speak MCP over HTTP to `https://<your-worker>/mcp` with `Authorizati
   ```
 - **Local models (vLLM)**: run Claude Code (or another MCP-capable CLI) against an Anthropic/OpenAI-compatible gateway such as LiteLLM in front of vLLM; use `cli=claude-local` and `LOCAL_GATEWAY_URL`. Put these identities in `SENSITIVE_ALLOWLIST` if sensitive data must stay on-prem.
 - **ChatGPT** (or any OAuth-only MCP client): set `OAUTH_IDENTITY` and the `OWNER_PASSWORD` secret, then add a custom connector with URL `https://<your-worker>/mcp` and OAuth auth. The Worker supports discovery (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`), dynamic client registration, authorization code + PKCE (S256) and rotating refresh tokens. You approve the connection by entering the owner password, and every OAuth token acts as `OAUTH_IDENTITY`. The client can't choose a sender. ChatGPT caches the tool list, so refresh the connector after you change tools.
+
+## Task permissions
+
+| Change | Who may do it |
+|---|---|
+| Any `task_update` | the task's owner, its reviewer, or an approver (if unowned: also its creator) |
+| `approved` | the task's reviewer, who must be an approver, from `in_review`, with `head_sha` |
+| `merged` | a merger (or anyone if `MERGERS` is empty), from `approved`, with the same `head_sha` |
+| Reassign or cancel a task that has an owner | that owner or an approver |
+| Change the reviewer, lower `data_level` from `sensitive`, clear `touches_mainline` | approvers only |
+| Claim a task someone else owns | approvers only; a reviewer can't claim the task they review |
+
+Going back to `in_review` (for example after a new commit) clears the approval. The final state is always re-checked, so a sensitive task can't end up owned by an identity outside `SENSITIVE_ALLOWLIST`.
+
+## Tests
+
+```bash
+cd worker && npm install && npm test
+```
+
+`test/run.mjs` starts its own `wrangler dev` with throwaway state and fake keys. It covers the state machine, every permission rule above (including known bypass attempts), the per-identity rate limit, OAuth refresh-token replay, the exact-origin check on login and the per-source password throttle.
 
 ## Release checklist for tool changes
 

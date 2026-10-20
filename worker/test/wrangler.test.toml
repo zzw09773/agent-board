@@ -1,0 +1,22 @@
+# Test-only config used by test/run.mjs (fake identities, local dev only).
+name = "agent-board-test"
+main = "../src/index.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+BOARD_NAME = "agent-board-test"
+IDENTITIES = "rev,claude,codex,local,noisy"
+APPROVERS = "rev"
+MERGERS = "claude"
+DEFAULT_REVIEWER = "rev"
+SENSITIVE_ALLOWLIST = "local"
+RATE_PER_MINUTE = "60"
+OAUTH_IDENTITY = "rev"
+
+[[durable_objects.bindings]]
+name = "BOARD"
+class_name = "Board"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Board"]

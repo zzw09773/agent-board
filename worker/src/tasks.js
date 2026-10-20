@@ -11,13 +11,14 @@ const now = () => new Date().toISOString();
 
 export function initTasks(sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, seq INTEGER UNIQUE, title TEXT, description TEXT, owner TEXT, reviewer TEXT, status TEXT, next_owner TEXT, links TEXT, touches_mainline INTEGER, data_level TEXT, created_by TEXT, created_at TEXT, updated_at TEXT)");
+  try { sql.exec("ALTER TABLE tasks ADD COLUMN approved_sha TEXT"); } catch { /* already there */ }
   sql.exec("CREATE TABLE IF NOT EXISTS task_hist(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, at TEXT, actor TEXT, action TEXT, detail TEXT)");
 }
 
 class RuleError extends Error {}
 const rule = (m) => new RuleError(m);
 
-const row = (r) => r && { id: r.id, seq: r.seq, title: r.title, description: r.description, owner: r.owner, reviewer: r.reviewer, status: r.status, next_owner: r.next_owner, links: JSON.parse(r.links || "{}"), touches_mainline: !!r.touches_mainline, data_level: r.data_level, created_by: r.created_by, created_at: r.created_at, updated_at: r.updated_at };
+const row = (r) => r && { id: r.id, seq: r.seq, title: r.title, description: r.description, owner: r.owner, reviewer: r.reviewer, status: r.status, next_owner: r.next_owner, links: JSON.parse(r.links || "{}"), touches_mainline: !!r.touches_mainline, data_level: r.data_level, approved_sha: r.approved_sha || null, created_by: r.created_by, created_at: r.created_at, updated_at: r.updated_at };
 const pub = (t) => { if (!t) return t; const { seq, ...o } = t; return o; };
 const get = (self, id) => row(self.sql.exec("SELECT * FROM tasks WHERE id=?", String(id || "").trim().toUpperCase()).toArray()[0]);
 const lockHolder = (self, except) => row(self.sql.exec("SELECT * FROM tasks WHERE touches_mainline=1 AND status IN ('in_progress','in_review') AND id<>? LIMIT 1", except || "").toArray()[0]) || null;
@@ -49,10 +50,14 @@ function check(self, cfg, t, prev, actor) {
       if (cfg.approvers.length && !cfg.approvers.includes(actor)) throw rule(`only ${cfg.approvers.join(", ")} can approve`);
       if (prev.status !== "in_review") throw rule(`approved can only follow in_review (currently ${prev.status})`);
       if (t.reviewer && t.reviewer !== actor) throw rule(`this task's reviewer is ${t.reviewer}, not ${actor}`);
+      if (!t.approved_sha || !SHA.test(t.approved_sha)) throw rule("approving requires head_sha: the full commit SHA you reviewed (40 or 64 hex chars)");
     }
     if (t.status === "merged") {
       if (prev.status !== "approved") throw rule(`merged can only follow approved (currently ${prev.status})`);
       if (cfg.mergers.length && !cfg.mergers.includes(actor)) throw rule(`only ${cfg.mergers.join(", ")} can merge`);
+      if (!t._head_sha) throw rule("merging requires head_sha: the commit SHA being merged");
+      if (!prev.approved_sha || prev.approved_sha !== t._head_sha)
+        throw rule(`head_sha ${t._head_sha} does not match the approved commit ${prev.approved_sha || "(none)"}; send it back to in_review`);
     }
   } else if (!prev && !["todo", "blocked", "cancelled"].includes(t.status)) throw rule("new tasks start as todo");
   if (["in_progress", "in_review", "approved"].includes(t.status) && !t.owner) throw rule(`${t.status} needs an owner; task_claim first`);
@@ -68,12 +73,38 @@ function check(self, cfg, t, prev, actor) {
 }
 
 function save(self, t) {
-  self.sql.exec("INSERT OR REPLACE INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", t.id, t.seq, t.title, t.description, t.owner, t.reviewer, t.status, t.next_owner, JSON.stringify(t.links || {}), t.touches_mainline ? 1 : 0, t.data_level, t.created_by, t.created_at, t.updated_at);
+  self.sql.exec("INSERT OR REPLACE INTO tasks(id,seq,title,description,owner,reviewer,status,next_owner,links,touches_mainline,data_level,created_by,created_at,updated_at,approved_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    t.id, t.seq, t.title, t.description, t.owner, t.reviewer, t.status, t.next_owner, JSON.stringify(t.links || {}), t.touches_mainline ? 1 : 0, t.data_level, t.created_by, t.created_at, t.updated_at, t.approved_sha || null);
+}
+
+const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/; // full SHA-1 or SHA-256 commit ids only
+const normSha = (v) => (v == null ? null : String(v).trim().toLowerCase());
+
+// Field-level authorization for task_update. Runs on the requested change set,
+// before check() validates the final merged state.
+function authorize(cfg, prev, t, actor) {
+  const isApprover = cfg.approvers.includes(actor);
+  const isMerger = cfg.mergers.length ? cfg.mergers.includes(actor) : false;
+  const isOwner = !!prev.owner && prev.owner === actor;
+  const isReviewer = !!prev.reviewer && prev.reviewer === actor;
+  const unownedCreator = !prev.owner && prev.created_by === actor;
+  const party = isOwner || isReviewer || isApprover || unownedCreator;
+  const mergingOnly = t.status === "merged" && prev.status === "approved" && isMerger;
+  if (!party && !mergingOnly) throw rule(`only the owner, reviewer or an approver can update ${prev.id}`);
+  if (mergingOnly && !party) {
+    for (const k of ["owner", "reviewer", "data_level", "touches_mainline", "title", "description"])
+      if (JSON.stringify(prev[k]) !== JSON.stringify(t[k])) throw rule(`a merger may only change status on ${prev.id}`);
+  }
+  if (prev.data_level === "sensitive" && t.data_level !== "sensitive" && !isApprover) throw rule("only an approver can lower data_level from sensitive");
+  if (prev.touches_mainline && !t.touches_mainline && !isApprover) throw rule("only an approver can clear touches_mainline");
+  if (prev.reviewer !== t.reviewer && !isApprover) throw rule("only an approver can change the reviewer");
+  if (prev.owner !== t.owner && prev.owner && !(isOwner || isApprover)) throw rule(`only the owner (${prev.owner}) or an approver can reassign ${prev.id}`);
+  if (t.status === "cancelled" && prev.status !== "cancelled" && prev.owner && !(isOwner || isApprover)) throw rule(`only the owner (${prev.owner}) or an approver can cancel ${prev.id}`);
 }
 const log = (self, id, actor, action, detail) => self.sql.exec("INSERT INTO task_hist(task_id,at,actor,action,detail) VALUES(?,?,?,?,?)", id, now(), actor, action, JSON.stringify(detail || {}));
 function diff(a, b) {
   const d = {};
-  for (const k of ["title", "description", "owner", "reviewer", "status", "next_owner", "touches_mainline", "data_level", "links"])
+  for (const k of ["title", "description", "owner", "reviewer", "status", "next_owner", "touches_mainline", "data_level", "links", "approved_sha"])
     if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) d[k] = [a[k] ?? null, b[k] ?? null];
   return d;
 }
@@ -104,8 +135,8 @@ export function TASK_TOOLS(cfg) {
       inputSchema: S({ title: { type: "string" }, description: { type: "string" }, owner: id, reviewer: id, next_owner: id, touches_mainline: { type: "boolean", default: false }, data_level: { type: "string", enum: LEVELS, default: "test" }, links, note: { type: "string" } }, ["title"]) },
     { name: "task_claim", title: "Claim task", annotations: rw, description: "Become owner and move todo/blocked -> in_progress. Mainline tasks need the mainline lock.",
       inputSchema: S({ id: { type: "string" }, note: { type: "string" } }, ["id"]) },
-    { name: "task_update", title: "Update task", annotations: rw, description: `Update status (${STATUSES.join("/")}), owner, reviewer, next_owner, links, note. Rules: approved only from in_review by the reviewer${cfg.approvers.length ? " (one of " + cfg.approvers.join(", ") + ")" : ""}; merged only from approved; reviewer != owner; one mainline task in flight; sensitive data only for allowlisted owners.`,
-      inputSchema: S({ id: { type: "string" }, status: { type: "string", enum: STATUSES }, owner: id, reviewer: id, next_owner: id, title: { type: "string" }, description: { type: "string" }, touches_mainline: { type: "boolean" }, data_level: { type: "string", enum: LEVELS }, links, note: { type: "string" } }, ["id"]) },
+    { name: "task_update", title: "Update task", annotations: rw, description: `Update status (${STATUSES.join("/")}), owner, reviewer, next_owner, links, note. Only the owner, reviewer or an approver may update (a merger may only merge). Rules: approved only from in_review by the reviewer, with head_sha${cfg.approvers.length ? " (one of " + cfg.approvers.join(", ") + ")" : ""}; merged only from approved with the same head_sha; only an approver can lower data_level, clear touches_mainline or change the reviewer; only owner/approver can reassign or cancel; reviewer != owner; one mainline task in flight; sensitive data only for allowlisted owners.`,
+      inputSchema: S({ id: { type: "string" }, status: { type: "string", enum: STATUSES }, owner: id, reviewer: id, next_owner: id, title: { type: "string" }, description: { type: "string" }, touches_mainline: { type: "boolean" }, data_level: { type: "string", enum: LEVELS }, head_sha: { type: "string", description: "commit SHA: required when approving (the reviewed commit) and when merging (must match)" }, links, note: { type: "string" } }, ["id"]) },
     { name: "task_list", title: "List tasks", annotations: ro, description: "List tasks (open ones by default). Filters: status, owner, next_owner, mine, include_closed.",
       inputSchema: S({ status: { type: "string", enum: STATUSES }, owner: { type: "string" }, next_owner: { type: "string" }, mine: { type: "boolean" }, include_closed: { type: "boolean", default: false }, limit: { type: "integer", default: 50, minimum: 1, maximum: 200 } }) },
     { name: "task_get", title: "Get task", annotations: ro, description: "Full task plus change history.", inputSchema: S({ id: { type: "string" } }, ["id"]) },
@@ -149,6 +180,8 @@ export async function taskCall(self, cfg, actor, name, a) {
       const t = { ...prev, links: { ...prev.links } };
       if (name === "task_claim") {
         if (!["todo", "blocked"].includes(prev.status)) throw rule(`${prev.id} is ${prev.status}; only todo/blocked can be claimed`);
+        if (prev.owner && prev.owner !== actor && !cfg.approvers.includes(actor)) throw rule(`${prev.id} is owned by ${prev.owner}; only they or an approver can take it over`);
+        if (prev.reviewer === actor) throw rule("the reviewer cannot claim the task they review");
         t.owner = actor; t.status = "in_progress"; t.next_owner = actor;
       } else {
         if (a.status != null) t.status = a.status;
@@ -159,12 +192,17 @@ export async function taskCall(self, cfg, actor, name, a) {
         if (a.data_level != null) t.data_level = a.data_level;
         t.links = mergeLinks(t.links, a.links);
         if (a.status === "in_review" && a.next_owner === undefined) t.next_owner = t.reviewer;
+        if (a.head_sha !== undefined) { const h = normSha(a.head_sha); if (h && !SHA.test(h)) throw rule("head_sha must be a full 40- or 64-char hex commit SHA"); t._head_sha = h; }
+        if (t.status === "approved" && prev.status !== "approved") t.approved_sha = t._head_sha || null;
+        if (["in_progress", "in_review", "todo", "blocked"].includes(t.status)) t.approved_sha = null;
         if (a.status === "approved" && a.next_owner === undefined) t.next_owner = cfg.mergers[0] || t.owner;
         if (DONE.includes(t.status) && a.next_owner === undefined) t.next_owner = null;
       }
+      if (name === "task_update") authorize(cfg, prev, t, actor);
       const d = diff(prev, t);
       if (!Object.keys(d).length && !a.note) return { ok: true, task: pub(prev), changed: false };
       check(self, cfg, t, prev, actor);
+      delete t._head_sha;
       t.updated_at = now();
       save(self, t);
       log(self, t.id, actor, name === "task_claim" ? "claim" : "update", { ...d, note: a.note || undefined });
