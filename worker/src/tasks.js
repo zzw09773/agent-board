@@ -3,7 +3,7 @@
 import { canon } from "./config.js";
 import { post, quotaLeft } from "./board.js";
 import { githubEnabled, prNumber, fetchPr } from "./github.js";
-import { markDirty } from "./checks.js";
+import { markDirty, checkInfo } from "./checks.js";
 
 export const STATUSES = ["todo", "in_progress", "in_review", "approved", "merged", "blocked", "cancelled"];
 const LOCKING = ["in_progress", "in_review"]; // states that hold the mainline lock
@@ -189,7 +189,8 @@ export async function taskCall(self, cfg, actor, name, a) {
       const t = get(self, a.id);
       if (!t) throw rule("no such task " + a.id);
       const history = self.sql.exec("SELECT at,actor,action,detail FROM task_hist WHERE task_id=? ORDER BY id DESC LIMIT 50", t.id).toArray().map((h) => ({ ...h, detail: JSON.parse(h.detail || "{}") }));
-      return { task: pub(t), history };
+      const checks = [...new Set([t.approved_sha, t.check_sha].filter(Boolean))].map((s) => checkInfo(self.sql, s)).filter(Boolean);
+      return { task: pub(t), history, ...(checks.length ? { github_check: checks } : {}) };
     }
     if (name === "task_new") {
       if (typeof a.title !== "string" || !a.title.trim()) throw rule("title is required");

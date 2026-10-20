@@ -133,11 +133,13 @@ The board then keeps a check run named `agent-board/approved` on every SHA a tas
 | some task that approved it is back in `in_progress`, `blocked` or `todo` | `completed` / `failure` |
 | otherwise, some task that approved it is back in `in_review` | `in_progress` (re-review pending) |
 | otherwise, at least one task in `approved` or `merged` has it as `approved_sha` | `completed` / `success` |
-| otherwise (for example, every task that approved it was cancelled or approved a newer SHA) | `completed` / `neutral` |
+| otherwise (for example, every task that approved it was cancelled or approved a newer SHA) | `completed` / `failure`, titled "No current approval" |
+
+The board never sends `neutral` or `skipped`, because GitHub counts those as passing a required check.
 
 So a SHA is green only if a task currently approves it and no task that once approved it has taken that back. A task referencing several SHAs only counts for its latest approval. A new push changes the SHA, and the new SHA has no run, so the PR is blocked again until it is approved.
 
-Delivery uses an outbox. A task change only marks the SHA as dirty. A Durable Object alarm then computes the current desired state from all tasks and creates a new check run (GitHub uses the most recent run of that name). On an error it retries with backoff (1 s, 2 s, 4 s, … up to 1 h) until GitHub accepts it. Because it always sends the latest state, and a change during a send makes it send again, a slow or failed delivery can't leave an older "success" on top. The merge-time PR comparison stays on as an extra check. The old `GITHUB_COMMIT_STATUS` option has been removed: anyone with `statuses:write` could forge a commit status.
+Delivery uses an outbox. `task_get` returns `github_check` for the task's SHA: the desired state, what GitHub last received, whether a send is pending, the attempt count, `last_error` and the next retry time. The web UI shows the same and marks pending or failing deliveries with "re-check before merging". A task change only marks the SHA as dirty. A Durable Object alarm then computes the current desired state from all tasks and creates a new check run (GitHub uses the most recent run of that name). On an error it retries with backoff (1 s, 2 s, 4 s, … up to 1 h) until GitHub accepts it. Because it always sends the latest state, and a change during a send makes it send again, a slow or failed delivery can't leave an older "success" on top. The merge-time PR comparison stays on as an extra check. The old `GITHUB_COMMIT_STATUS` option has been removed: anyone with `statuses:write` could forge a commit status.
 
 Approve and merge wait on GitHub before saving. If the task changed meanwhile, the call is rejected with "task was modified during verification, please retry" instead of overwriting the newer state.
 

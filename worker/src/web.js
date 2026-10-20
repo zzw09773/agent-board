@@ -1,6 +1,7 @@
 // Read-only web view of the board and task table, behind the owner password.
 // Session: random token in an HttpOnly, Secure, SameSite=Strict cookie; stored hashed, 12 h TTL.
 import { sha, rand, checkPassword, clientIp, passwordOk, MIN_PASSWORD } from "./oauth.js";
+import { checkInfo } from "./checks.js";
 const TTL = 12 * 3600e3, COOKIE = "board_session";
 const json = (o, s = 200, h = {}) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json", "cache-control": "no-store", ...h } });
 const SEC = { "x-frame-options": "DENY", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff",
@@ -26,7 +27,7 @@ const JS = `const $=s=>document.querySelector(s),m=$("#list");let tab="board";
 const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
 async function load(){const r=await fetch("/board/api/"+(tab==="board"?"messages":"tasks"),{credentials:"same-origin"});if(r.status===401)return location.reload();const j=await r.json();m.replaceChildren();
  if(tab==="board"){for(const x of j.messages){const c=el("div","card"),h=el("div","meta");h.append(el("b",null,"#"+x.id),el("span",null,x.from+" → "+x.to),el("span",null,new Date(x.created_at).toLocaleString()));c.append(h,el("div","body",x.text));m.append(c)}}
- else{if(j.mainline_lock)m.append(el("div","card","Mainline lock: "+j.mainline_lock.id+" ("+j.mainline_lock.owner+")"));for(const t of j.tasks){const c=el("div","card"),h=el("div","meta");h.append(el("b",null,t.id),el("span","st",t.status),el("span",null,"owner "+(t.owner||"-")+" · next "+(t.next_owner||"-")+" · reviewer "+(t.reviewer||"-")));c.append(h,el("div","body",t.title+(t.description?"\\n"+t.description:"")));m.append(c)}}
+ else{if(j.mainline_lock)m.append(el("div","card","Mainline lock: "+j.mainline_lock.id+" ("+j.mainline_lock.owner+")"));for(const t of j.tasks){const c=el("div","card"),h=el("div","meta");h.append(el("b",null,t.id),el("span","st",t.status),el("span",null,"owner "+(t.owner||"-")+" · next "+(t.next_owner||"-")+" · reviewer "+(t.reviewer||"-")));c.append(h,el("div","body",t.title+(t.description?"\\n"+t.description:"")));const k=t.check;if(k){const g=el("div","meta","GitHub check "+k.sha.slice(0,10)+": should be "+k.desired+" · GitHub has "+(k.delivered||"nothing yet")+(k.pending?" · delivery pending (attempt "+k.attempts+", next "+new Date(k.next_retry).toLocaleTimeString()+")":"")+(k.last_error?" · last error: "+k.last_error:"")+(k.pending?" · re-check before merging":""));if(k.pending||k.last_error)g.style.color="#b45309";c.append(g)}m.append(c)}}
  if(!m.children.length)m.append(el("p",null,"Nothing yet."))}
 for(const b of document.querySelectorAll("[data-tab]"))b.onclick=()=>{tab=b.dataset.tab;for(const o of document.querySelectorAll("[data-tab]"))o.setAttribute("aria-selected",o===b);load()};
 $("#out").onclick=async()=>{await fetch("/board/logout",{method:"POST",credentials:"same-origin"});location.reload()};load();setInterval(load,15000);`;
@@ -57,7 +58,8 @@ export async function handleWeb(self, cfg, req, base) {
     if (!ok) return json({ error: "unauthorized" }, 401);
     if (p === "/board/api/messages") return json({ messages: self.sql.exec("SELECT id,created_at,to_name AS 'to',from_name AS 'from',text FROM board ORDER BY id DESC LIMIT 200").toArray() });
     if (p === "/board/api/tasks") {
-      const tasks = self.sql.exec("SELECT id,title,description,owner,reviewer,status,next_owner,data_level,touches_mainline,updated_at FROM tasks ORDER BY seq DESC LIMIT 300").toArray();
+      const tasks = self.sql.exec("SELECT id,title,description,owner,reviewer,status,next_owner,data_level,touches_mainline,updated_at,approved_sha,check_sha FROM tasks ORDER BY seq DESC LIMIT 300").toArray();
+      for (const t of tasks) { t.check = checkInfo(self.sql, t.approved_sha || t.check_sha); delete t.check_sha; }
       const lk = tasks.find((t) => t.touches_mainline && ["in_progress", "in_review"].includes(t.status));
       return json({ tasks, mainline_lock: lk ? { id: lk.id, owner: lk.owner } : null });
     }

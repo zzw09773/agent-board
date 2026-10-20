@@ -14,7 +14,8 @@ export function initChecks(sql) {
 //  - a "withdrawn" task: references the SHA via check_sha, no longer approves it, and is not finished
 //    (cancelled/merged). Any such task in in_review -> in_progress (re-review pending); in any other state -> failure.
 //  - otherwise success iff at least one task in approved/merged has approved_sha = SHA
-//  - otherwise neutral (nobody vouches for it any more, e.g. all referencing tasks were cancelled or moved on)
+//  - otherwise failure, titled "No current approval" (nobody vouches for it any more, e.g. all referencing tasks
+//    were cancelled or approved a newer SHA). Never neutral/skipped: GitHub counts those as PASSING required checks.
 // So success needs a current approval AND no task that once approved this SHA has since taken it back.
 export function desiredState(sql, sha) {
   const rows = sql.exec("SELECT id, status, approved_sha, check_sha FROM tasks WHERE approved_sha=? OR check_sha=? ORDER BY seq", sha, sha).toArray();
@@ -24,7 +25,7 @@ export function desiredState(sql, sha) {
   if (withdrawn.some((r) => r.status !== "in_review")) return { status: "completed", conclusion: "failure", title: "Approval withdrawn", summary: `Withdrawn by: ${ids(withdrawn)}` };
   if (withdrawn.length) return { status: "in_progress", title: "Back in review", summary: `Re-review pending: ${ids(withdrawn)}` };
   if (approving.length) return { status: "completed", conclusion: "success", title: "Approved on agent-board", summary: `Approved by task(s): ${ids(approving)}` };
-  return { status: "completed", conclusion: "neutral", title: "No current approval", summary: "No task currently approves this commit." };
+  return { status: "completed", conclusion: "failure", title: "No current approval", summary: "No task currently approves this commit." };
 }
 const label = (s) => s.conclusion || s.status;
 
@@ -58,4 +59,13 @@ export async function runOutbox(self) {
   if (next != null) await self.ctx.storage.setAlarm(Math.max(next, Date.now()));
 }
 
+// Delivery state of the check run for one SHA, for task_get and the web UI (null if never queued).
+export function checkInfo(sql, sha) {
+  if (!sha) return null;
+  const r = sql.exec("SELECT sha, gen, sent_gen, attempts, next_at, last_state, last_error FROM check_outbox WHERE sha=?", sha).toArray()[0];
+  if (!r) return null;
+  const pending = r.gen > r.sent_gen;
+  return { sha, check: CHECK_NAME, desired: label(desiredState(sql, sha)), delivered: r.last_state || null, pending,
+    attempts: r.attempts, last_error: r.last_error || null, next_retry: pending ? new Date(r.next_at).toISOString() : null };
+}
 export const outboxRows = (sql) => sql.exec("SELECT sha, gen, sent_gen, attempts, last_state, last_error FROM check_outbox ORDER BY sha").toArray();

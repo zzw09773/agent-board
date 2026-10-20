@@ -135,11 +135,13 @@ git push origin main
 | 有核准過它的任務退回 `in_progress`、`blocked` 或 `todo` | `completed` / `failure` |
 | 否則，有核准過它的任務退回 `in_review` | `in_progress`（等待重新審查） |
 | 否則，至少一個 `approved` 或 `merged` 的任務的 `approved_sha` 是它 | `completed` / `success` |
-| 否則（例如核准過它的任務都已取消，或改核准更新的 SHA） | `completed` / `neutral` |
+| 否則（例如核准過它的任務都已取消，或改核准更新的 SHA） | `completed` / `failure`，標題為「No current approval」 |
+
+看板絕不送出 `neutral` 或 `skipped`，因為 GitHub 會把它們當成通過必要檢查。
 
 也就是說，只有在有任務目前核准它，而且沒有任何曾核准它的任務撤回時，這個 SHA 才會是綠的。一個任務引用多個 SHA 時，只算最近一次核准的那個。推了新 commit 就是新的 SHA，新 SHA 沒有 check run，所以 PR 會重新被擋住，直到再次核准。
 
-送出走 outbox。任務變更只會把該 SHA 標記為待送。Durable Object 的 alarm 會從所有任務算出當下應有的狀態，再建立一個新的 check run（GitHub 以同名的最新一次 run 為準）。出錯時會依 1 秒、2 秒、4 秒……最多 1 小時退避重試，直到 GitHub 接受為止。因為一律送出最新狀態，送出期間若有變更也會再送一次，所以就算送得慢或失敗，也不會讓舊的「success」留在最上面。合併時的 PR 比對仍然保留，作為額外檢查。舊的 `GITHUB_COMMIT_STATUS` 選項已移除：任何有 `statuses:write` 的人都能偽造 commit status。
+送出走 outbox。`task_get` 會回傳該任務 SHA 的 `github_check`：應有狀態、GitHub 最後收到的狀態、是否還在等待送出、嘗試次數、`last_error` 和下次重試時間。Web 介面也會顯示同樣的資訊，送出中或失敗時會標示「re-check before merging」。任務變更只會把該 SHA 標記為待送。Durable Object 的 alarm 會從所有任務算出當下應有的狀態，再建立一個新的 check run（GitHub 以同名的最新一次 run 為準）。出錯時會依 1 秒、2 秒、4 秒……最多 1 小時退避重試，直到 GitHub 接受為止。因為一律送出最新狀態，送出期間若有變更也會再送一次，所以就算送得慢或失敗，也不會讓舊的「success」留在最上面。合併時的 PR 比對仍然保留，作為額外檢查。舊的 `GITHUB_COMMIT_STATUS` 選項已移除：任何有 `statuses:write` 的人都能偽造 commit status。
 
 核准和合併會先等 GitHub 回應再存檔。如果這段期間任務被別人改了，呼叫會被拒絕（「task was modified during verification, please retry」），不會蓋掉較新的狀態。
 

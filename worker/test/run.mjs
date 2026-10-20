@@ -24,11 +24,12 @@ const PRS = {};
 const APP = generateKeyPairSync("rsa", { modulusLength: 2048 });
 const APP_PEM = APP.privateKey.export({ type: "pkcs1", format: "pem" }); // the format GitHub hands out
 const INST_TOKEN = "ghs_test_" + randomBytes(8).toString("hex");
-const CHECKS = {}, GH = { failChecks: 0, checkDelay: 0, tokenCalls: 0, badJwt: 0 };
+const OTHER = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const CHECKS = {}, GH = { failChecks: 0, checkDelay: 0, tokenCalls: 0, badJwt: 0, wrongKey: false, revoke: false };
 function jwtOk(h) {
   const [hd, pl, sig] = String(h || "").replace(/^Bearer /, "").split(".");
   if (!sig) return false;
-  const good = cryptoVerify("RSA-SHA256", Buffer.from(hd + "." + pl), APP.publicKey, Buffer.from(sig, "base64url"));
+  const good = cryptoVerify("RSA-SHA256", Buffer.from(hd + "." + pl), (GH.wrongKey ? OTHER : APP).publicKey, Buffer.from(sig, "base64url"));
   const c = JSON.parse(Buffer.from(pl, "base64url").toString());
   return good && c.iss === "12345" && c.exp > Date.now() / 1000;
 }
@@ -40,12 +41,12 @@ const gh = createServer((req, res) => {
       if (!jwtOk(req.headers.authorization)) { GH.badJwt++; return send(401, {}); }
       GH.tokenCalls++; return send(201, { token: INST_TOKEN, expires_at: new Date(Date.now() + 3600e3).toISOString() });
     }
-    if (req.headers.authorization !== `Bearer ${INST_TOKEN}`) return send(401, {});
+    if (req.headers.authorization !== `Bearer ${INST_TOKEN}` || (GH.revoke && req.url.endsWith("/check-runs"))) return send(401, {});
     if (req.method === "POST" && req.url === "/repos/test-org/test-repo/check-runs") {
       const j = JSON.parse(b);
       return setTimeout(() => {
         if (GH.failChecks > 0) { GH.failChecks--; return send(502, {}); }
-        (CHECKS[j.head_sha] ||= []).push({ name: j.name, status: j.status, conclusion: j.conclusion || null });
+        (CHECKS[j.head_sha] ||= []).push({ name: j.name, status: j.status, conclusion: j.conclusion || null, title: j.output?.title });
         send(201, { id: Math.floor(Math.random() * 1e9) });
       }, GH.checkDelay);
     }
@@ -346,11 +347,11 @@ test("GitHub App check run: approve -> success, back to review -> in_progress, r
   PRS[12] = { head: S4, merged: false };
   ok(await call("rev", "task_update", { id, status: "approved", head_sha: S4 }, B2));
   await waitCheck(S4, "success");
-  await waitCheck(S3, "neutral");                        // nobody vouches for the old SHA any more
+  await waitCheck(S3, "failure");                        // nobody vouches for the old SHA any more (never neutral)
   ok(await call("claude", "task_update", { id, status: "in_progress" }, B2));
   await waitCheck(S4, "failure");
   assert.ok(GH.tokenCalls >= 1 && GH.tokenCalls <= 2, "installation token is cached, got " + GH.tokenCalls);
-  assert.equal(GH.badJwt, 0);
+  assert.equal(GH.badJwt, 0); // (the wrong-key test below runs later)
 });
 
 test("outbox: check-run delivery retries after 5xx and ends in the correct state", async () => {
@@ -400,7 +401,59 @@ test("same SHA on several tasks: success needs a current approval and no task th
   ok(await call("claude", "task_update", { id: b, status: "cancelled" }, B2));
   await waitCheck(X, "success");                         // a cancelled task stops blocking; a still approves
   ok(await call("claude", "task_update", { id: a, status: "cancelled" }, B2));
-  await waitCheck(X, "neutral");                         // nobody approves it any more
+  await waitCheck(X, "failure");                         // nobody approves it any more (never neutral)
+});
+
+const allConclusions = () => Object.values(CHECKS).flat().map((c) => c.conclusion).filter(Boolean);
+
+test("never neutral: approve then cancel gives failure", async () => {
+  const S8 = "5".repeat(40);
+  const id = await ghTask(18); PRS[18] = { head: S8, merged: false };
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S8 }, B2));
+  await waitCheck(S8, "success");
+  ok(await call("claude", "task_update", { id, status: "cancelled" }, B2));
+  await waitCheck(S8, "failure");
+  assert.equal(CHECKS[S8].at(-1).title, "No current approval");
+});
+
+test("never neutral: S3 approved, withdrawn, then S4 approved leaves S3 at failure", async () => {
+  const S3 = "6".repeat(40), S4 = "7".repeat(40);
+  const id = await ghTask(19); PRS[19] = { head: S3, merged: false };
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S3 }, B2));
+  await waitCheck(S3, "success");
+  ok(await call("claude", "task_update", { id, status: "in_progress" }, B2));
+  await waitCheck(S3, "failure");
+  ok(await call("claude", "task_update", { id, status: "in_review" }, B2));
+  PRS[19] = { head: S4, merged: false };
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S4 }, B2));
+  await waitCheck(S4, "success");
+  await waitCheck(S3, "failure");
+  assert.equal(CHECKS[S3].at(-1).title, "No current approval");
+  assert.ok(!allConclusions().some((c) => c === "neutral" || c === "skipped"), "neutral/skipped never emitted: " + JSON.stringify(allConclusions()));
+});
+
+test("outbox failures are visible: wrong App key shows last_error in task_get and the web UI", async () => {
+  const S9 = "8".repeat(40);
+  const id = await ghTask(20); PRS[20] = { head: S9, merged: false };
+  GH.wrongKey = true; GH.revoke = true;      // GitHub no longer accepts the board's App key; the cached token is revoked
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S9 }, B2));
+  let g;
+  for (let i = 0; i < 60; i++) { g = await call("rev", "task_get", { id }, B2); if (/token request failed \(401\)/.test(g.github_check?.[0]?.last_error || "")) break; await sleep(250); }
+  const k = g.github_check[0];
+  assert.equal(k.sha, S9); assert.equal(k.desired, "success"); assert.equal(k.pending, true);
+  assert.match(k.last_error, /GitHub App token request failed \(401\)/);
+  assert.ok(k.attempts >= 2 && k.next_retry, JSON.stringify(k));
+  // web UI shows the same
+  const r = await fetch(B2 + "/board/login", { method: "POST", redirect: "manual", body: new URLSearchParams({ password: PW }), headers: { origin: B2, "cf-connecting-ip": "198.51.100.77" } });
+  const cookie = (r.headers.get("set-cookie") || "").split(";")[0];
+  const w = (await (await fetch(B2 + "/board/api/tasks", { headers: { cookie } })).json()).tasks.find((t) => t.id === id);
+  assert.match(w.check.last_error, /token request failed/); assert.equal(w.check.pending, true);
+  assert.ok((await (await fetch(B2 + "/board/app.js", { headers: { cookie } })).text()).includes("re-check before merging"));
+  // key fixed: the retry delivers and the error clears
+  GH.wrongKey = false; GH.revoke = false;
+  await waitCheck(S9, "success", 30000);
+  g = await call("rev", "task_get", { id }, B2);
+  assert.equal(g.github_check[0].pending, false); assert.equal(g.github_check[0].last_error, null); assert.equal(g.github_check[0].delivered, "success");
 });
 
 test("unit: source keys are /32 for IPv4 and /64 for IPv6; password minimum is 16", async () => {

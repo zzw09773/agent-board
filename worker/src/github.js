@@ -62,7 +62,7 @@ export async function fetchPr(env, n) {
 }
 
 // Each change creates a new check run; GitHub evaluates the most recent run of a given name on a commit.
-// state: { status: "completed"|"in_progress", conclusion?: "success"|"failure"|"neutral", summary }
+// state: { status: "completed"|"in_progress", conclusion?: "success"|"failure" (never neutral/skipped: GitHub treats those as passing), summary }
 export async function createCheckRun(env, sha, state) {
   const body = { name: CHECK_NAME, head_sha: sha, status: state.status, output: { title: state.title || CHECK_NAME, summary: state.summary || "" } };
   if (state.status === "completed") body.conclusion = state.conclusion;
