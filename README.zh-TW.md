@@ -122,7 +122,24 @@ git push origin main
 
 接著用同一個 `head_sha` 把任務設成 `merged`。預設情況下，伺服器只能比對你回報的 SHA。如果要直接向 GitHub 查證，請設定 `GITHUB_REPO = "owner/name"` 和一個能讀 pull request 的 `GITHUB_TOKEN` secret，並在 `links.prs` 附上 PR 連結。這樣核准時 PR 目前的 head 必須等於 `head_sha`，合併時 PR 必須已經在核准的 SHA 上合併（head 或 merge commit 相符）。每次都會重新檢查最終狀態，所以 sensitive 任務不可能落到 `SENSITIVE_ALLOWLIST` 以外的身分手上。
 
-**讓 GitHub 直接擋（建議）。** 上面的檢查只能在合併之後發現問題。若要讓 GitHub 事先擋下，再設定 `GITHUB_COMMIT_STATUS = "1"`，並給 token **Commit statuses: write**（`statuses:write`）權限。核准時，看板會在 `approved_sha` 上寫入 context 為 `agent-board/approved` 的 `success` commit status（可用 `GITHUB_STATUS_CONTEXT` 改名）。撤回核准時，退回 `in_review` 會改成 `pending`，退回 `in_progress`、`blocked`、`cancelled` 等則改成 `failure`。在主分支的 branch protection（或 ruleset）開啟 **Require status checks to pass**，並把 `agent-board/approved` 設為必要檢查。這樣 GitHub 會拒絕合併 head SHA 沒被看板核准的 PR；推了新 commit 也會重新擋住，因為新的 SHA 沒有 status。合併時的比對仍然保留，作為額外檢查。寫入 status 失敗時，呼叫仍會成功，並回報 `github_status.error`。SHA 上沒有 status，必要檢查就不會通過，所以寫入失敗只會擋下合併，不會放行。
+**讓 GitHub 直接擋（建議）：GitHub App ＋ 必要檢查。** 上面的 PR 檢查只能在合併之後發現問題。若要讓 GitHub 事先擋下，請讓看板以 **GitHub App** 身分運作，並把它的 check run 設成必要檢查：
+
+1. 建立一個 GitHub App（Settings → Developer settings → GitHub Apps），repository 權限設 **Checks: Read and write** 和 **Pull requests: Read-only**，不需要 webhook。把它安裝到 repo，記下 App ID 和 installation ID（installation 設定頁網址裡的數字）。
+2. 把 `GITHUB_REPO`、`GITHUB_APP_ID`、`GITHUB_APP_INSTALLATION_ID` 設成 vars，再用 `wrangler secret put GITHUB_APP_PRIVATE_KEY < app.private-key.pem` 存入 App 私鑰（就是從 GitHub 下載的 PEM）。看板會用私鑰簽一個短效 JWT，換成 installation token，並快取到快過期前。設定 App 之後，`GITHUB_TOKEN` 會被忽略。
+3. 在主分支的 branch protection（或 ruleset）開啟 **Require status checks to pass**，加入 **`agent-board/approved`**，並把預期來源設成**你的 App**，不要選「任何來源」。這點很重要：有 repo 寫入權的 coder agent 可以用自己的 token 建立同名的 commit status 或 check run。只有 App 的 check run 會被採計，而只有看板持有 App 私鑰。
+
+之後看板會在每個被任務核准過的 SHA 上維護名為 `agent-board/approved` 的 check run：
+
+| 引用該 SHA 的任務 | Check run |
+|---|---|
+| 有核准過它的任務退回 `in_progress`、`blocked` 或 `todo` | `completed` / `failure` |
+| 否則，有核准過它的任務退回 `in_review` | `in_progress`（等待重新審查） |
+| 否則，至少一個 `approved` 或 `merged` 的任務的 `approved_sha` 是它 | `completed` / `success` |
+| 否則（例如核准過它的任務都已取消，或改核准更新的 SHA） | `completed` / `neutral` |
+
+也就是說，只有在有任務目前核准它，而且沒有任何曾核准它的任務撤回時，這個 SHA 才會是綠的。一個任務引用多個 SHA 時，只算最近一次核准的那個。推了新 commit 就是新的 SHA，新 SHA 沒有 check run，所以 PR 會重新被擋住，直到再次核准。
+
+送出走 outbox。任務變更只會把該 SHA 標記為待送。Durable Object 的 alarm 會從所有任務算出當下應有的狀態，再建立一個新的 check run（GitHub 以同名的最新一次 run 為準）。出錯時會依 1 秒、2 秒、4 秒……最多 1 小時退避重試，直到 GitHub 接受為止。因為一律送出最新狀態，送出期間若有變更也會再送一次，所以就算送得慢或失敗，也不會讓舊的「success」留在最上面。合併時的 PR 比對仍然保留，作為額外檢查。舊的 `GITHUB_COMMIT_STATUS` 選項已移除：任何有 `statuses:write` 的人都能偽造 commit status。
 
 核准和合併會先等 GitHub 回應再存檔。如果這段期間任務被別人改了，呼叫會被拒絕（「task was modified during verification, please retry」），不會蓋掉較新的狀態。
 
@@ -142,7 +159,7 @@ cd worker && npm install && npm test
 
 設定 `OWNER_PASSWORD` 之後，`https://<your-worker>/board` 會顯示留言板和任務表的唯讀畫面，需用擁有者密碼登入。Session 是 HttpOnly、Secure、SameSite=Strict 的 cookie，有效 12 小時。登入失敗會被限速。網頁上沒有任何寫入功能。
 
-登入失敗會依來源網路限速（IPv4 每個位址、IPv6 每個 /64），沒有全站鎖定。若要在邊緣防護，請在 Cloudflare WAF 為 `POST /board/login` 和 `/authorize` 加上 rate limiting 規則。
+登入失敗會依來源網路限速（IPv4 每個位址、IPv6 每個 /64），沒有全站鎖定。若要在邊緣防護，請在 Cloudflare WAF 為 `POST /board/login` 和 `/authorize` 加上 rate limiting 規則。WAF 只作用在 Cloudflare zone 上，所以看板要用你自己 zone 底下的**自訂網域**提供服務（`routes = [{ pattern = "board.example.com", custom_domain = true }]`），並設定 `workers_dev = false`。走 `*.workers.dev` 的流量不會經過你 zone 的 WAF 規則。
 
 ## 授權
 

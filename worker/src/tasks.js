@@ -2,7 +2,8 @@
 // so no agent can skip review, self-approve, or hand sensitive work to a cloud model.
 import { canon } from "./config.js";
 import { post, quotaLeft } from "./board.js";
-import { githubEnabled, prNumber, fetchPr, statusEnabled, setStatus } from "./github.js";
+import { githubEnabled, prNumber, fetchPr } from "./github.js";
+import { markDirty } from "./checks.js";
 
 export const STATUSES = ["todo", "in_progress", "in_review", "approved", "merged", "blocked", "cancelled"];
 const LOCKING = ["in_progress", "in_review"]; // states that hold the mainline lock
@@ -12,14 +13,14 @@ const now = () => new Date().toISOString();
 
 export function initTasks(sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, seq INTEGER UNIQUE, title TEXT, description TEXT, owner TEXT, reviewer TEXT, status TEXT, next_owner TEXT, links TEXT, touches_mainline INTEGER, data_level TEXT, created_by TEXT, created_at TEXT, updated_at TEXT)");
-  try { sql.exec("ALTER TABLE tasks ADD COLUMN approved_sha TEXT"); } catch { /* already there */ }
+  for (const c of ["approved_sha TEXT", "check_sha TEXT"]) { try { sql.exec("ALTER TABLE tasks ADD COLUMN " + c); } catch { /* already there */ } }
   sql.exec("CREATE TABLE IF NOT EXISTS task_hist(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, at TEXT, actor TEXT, action TEXT, detail TEXT)");
 }
 
 class RuleError extends Error {}
 const rule = (m) => new RuleError(m);
 
-const row = (r) => r && { id: r.id, seq: r.seq, title: r.title, description: r.description, owner: r.owner, reviewer: r.reviewer, status: r.status, next_owner: r.next_owner, links: JSON.parse(r.links || "{}"), touches_mainline: !!r.touches_mainline, data_level: r.data_level, approved_sha: r.approved_sha || null, created_by: r.created_by, created_at: r.created_at, updated_at: r.updated_at };
+const row = (r) => r && { id: r.id, seq: r.seq, title: r.title, description: r.description, owner: r.owner, reviewer: r.reviewer, status: r.status, next_owner: r.next_owner, links: JSON.parse(r.links || "{}"), touches_mainline: !!r.touches_mainline, data_level: r.data_level, approved_sha: r.approved_sha || null, check_sha: r.check_sha || null, created_by: r.created_by, created_at: r.created_at, updated_at: r.updated_at };
 const pub = (t) => { if (!t) return t; const { seq, ...o } = t; return o; };
 const get = (self, id) => row(self.sql.exec("SELECT * FROM tasks WHERE id=?", String(id || "").trim().toUpperCase()).toArray()[0]);
 const lockHolder = (self, except) => row(self.sql.exec("SELECT * FROM tasks WHERE touches_mainline=1 AND status IN ('in_progress','in_review') AND id<>? LIMIT 1", except || "").toArray()[0]) || null;
@@ -75,8 +76,8 @@ function check(self, cfg, t, prev, actor) {
 }
 
 function save(self, t) {
-  self.sql.exec("INSERT OR REPLACE INTO tasks(id,seq,title,description,owner,reviewer,status,next_owner,links,touches_mainline,data_level,created_by,created_at,updated_at,approved_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-    t.id, t.seq, t.title, t.description, t.owner, t.reviewer, t.status, t.next_owner, JSON.stringify(t.links || {}), t.touches_mainline ? 1 : 0, t.data_level, t.created_by, t.created_at, t.updated_at, t.approved_sha || null);
+  self.sql.exec("INSERT OR REPLACE INTO tasks(id,seq,title,description,owner,reviewer,status,next_owner,links,touches_mainline,data_level,created_by,created_at,updated_at,approved_sha,check_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    t.id, t.seq, t.title, t.description, t.owner, t.reviewer, t.status, t.next_owner, JSON.stringify(t.links || {}), t.touches_mainline ? 1 : 0, t.data_level, t.created_by, t.created_at, t.updated_at, t.approved_sha || null, t.check_sha || null);
 }
 
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/; // full SHA-1 or SHA-256 commit ids only
@@ -140,18 +141,8 @@ async function githubCheck(self, t, prev) {
   if (merging) {
     if (!pr.merged) throw rule(`PR #${n} is not merged on GitHub yet; merge the approved SHA first (git merge --ff-only ${prev.approved_sha})`);
     if (pr.head !== prev.approved_sha && pr.mergeCommit !== prev.approved_sha) throw rule(`PR #${n} was merged at ${pr.head} (merge commit ${pr.mergeCommit}), not the approved ${prev.approved_sha}`);
-  }  return true;
-}
-// Commit status on GitHub (only with GITHUB_COMMIT_STATUS=1), written after the board state is saved.
-// A failed write never leaves a stale "success": the worst case is a missing status, which a required check blocks.
-async function publishStatus(self, t, prev) {
-  const env = self.env;
-  if (!statusEnabled(env)) return null;
-  let sha, state, desc;
-  if (t.approved_sha && t.approved_sha !== prev.approved_sha) { sha = t.approved_sha; state = "success"; desc = `${t.id} approved by the reviewer on agent-board`; }
-  else if (prev.approved_sha && !t.approved_sha && t.status !== "merged") { sha = prev.approved_sha; state = t.status === "in_review" ? "pending" : "failure"; desc = `${t.id} approval withdrawn (now ${t.status})`; }
-  else return null;
-  try { await setStatus(env, sha, state, desc); return { sha, state }; } catch (e) { return { sha, state, error: String(e.message || e) }; }
+  }
+  return true;
 }
 async function notify(self, cfg, t, prev, actor, reason) {
   const sent = [];
@@ -234,7 +225,7 @@ export async function taskCall(self, cfg, actor, name, a) {
         t.links = mergeLinks(t.links, a.links);
         if (a.status === "in_review" && a.next_owner === undefined) t.next_owner = t.reviewer;
         if (a.head_sha !== undefined) { const h = normSha(a.head_sha); if (h && !SHA.test(h)) throw rule("head_sha must be a full 40- or 64-char hex commit SHA"); t._head_sha = h; }
-        if (t.status === "approved" && prev.status !== "approved") t.approved_sha = t._head_sha || null;
+        if (t.status === "approved" && prev.status !== "approved") { t.approved_sha = t._head_sha || null; t.check_sha = t.approved_sha; }
         if (["in_progress", "in_review", "todo", "blocked"].includes(t.status)) t.approved_sha = null;
         if (a.status === "approved" && a.next_owner === undefined) t.next_owner = cfg.mergers[0] || t.owner;
         if (DONE.includes(t.status) && a.next_owner === undefined) t.next_owner = null;
@@ -255,8 +246,9 @@ export async function taskCall(self, cfg, actor, name, a) {
       t.updated_at = now();
       save(self, t);
       log(self, t.id, actor, name === "task_claim" ? "claim" : "update", { ...d, note: a.note || undefined });
-      const github_status = await publishStatus(self, t, prev);
-      return { ok: true, task: pub(t), changes: d, ...(github_status ? { github_status } : {}), woke: await notify(self, cfg, t, prev, actor) };
+      const github_check = prev.status !== t.status || prev.approved_sha !== t.approved_sha || prev.check_sha !== t.check_sha
+        ? await markDirty(self, [prev.approved_sha, t.approved_sha, prev.check_sha, t.check_sha]) : null;
+      return { ok: true, task: pub(t), changes: d, ...(github_check ? { github_check } : {}), woke: await notify(self, cfg, t, prev, actor) };
     }
   } catch (e) {
     if (e instanceof RuleError) return { ok: false, error: e.message };

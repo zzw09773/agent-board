@@ -120,7 +120,24 @@ git push origin main
 
 Then set the task to `merged` with the same `head_sha`. By default the server can only compare the SHA you report. To check against GitHub itself, set `GITHUB_REPO = "owner/name"` and a `GITHUB_TOKEN` secret that can read pull requests, and link the PR in `links.prs`. Approving then requires the PR's current head to equal `head_sha`, and merging requires the PR to be merged at the approved SHA (its head or merge commit). The final state is always re-checked, so a sensitive task can't end up owned by an identity outside `SENSITIVE_ALLOWLIST`.
 
-**Let GitHub enforce it (recommended).** Those checks only detect a bad merge after the fact. To have GitHub block it, also set `GITHUB_COMMIT_STATUS = "1"` and give the token **Commit statuses: write** (`statuses:write`). On approve, the board writes a `success` commit status with context `agent-board/approved` (override with `GITHUB_STATUS_CONTEXT`) on `approved_sha`. If the approval is withdrawn, it sets that status to `pending` (back to `in_review`) or `failure` (back to `in_progress`, `blocked`, `cancelled`, …). In the repo's branch protection (or ruleset) for the main branch, enable **Require status checks to pass** and add `agent-board/approved` as a required check. GitHub then refuses to merge any PR whose head SHA the board hasn't approved, and a new push resets it because the new SHA has no status. The merge-time comparison stays on as an extra check. If writing the status fails, the call still succeeds and reports `github_status.error`. With no status on the SHA, the required check stays unmet, so a failure blocks the merge instead of allowing it.
+**Let GitHub enforce it (recommended): GitHub App + required check.** Those PR checks only detect a bad merge after the fact. To have GitHub block it, run the board as a **GitHub App** and require its check run:
+
+1. Create a GitHub App (Settings → Developer settings → GitHub Apps) with repository permissions **Checks: Read and write** and **Pull requests: Read-only**, no webhook. Install it on the repo, and note the App ID and the installation ID (the number in the installation's settings URL).
+2. Set `GITHUB_REPO`, `GITHUB_APP_ID` and `GITHUB_APP_INSTALLATION_ID` as vars, and save the App's private key with `wrangler secret put GITHUB_APP_PRIVATE_KEY < app.private-key.pem` (the PEM exactly as GitHub downloads it). The board signs a short JWT with the key, exchanges it for an installation token, and caches that token until shortly before it expires. With the App set, `GITHUB_TOKEN` is ignored.
+3. In branch protection (or a ruleset) for the main branch, enable **Require status checks to pass**, add **`agent-board/approved`**, and set its expected source to **your App**, not "any source". This matters because a coder agent with repo write access can create commit statuses, or check runs under its own token, with the same name. Only the App's check run counts, and only the board holds the App key.
+
+The board then keeps a check run named `agent-board/approved` on every SHA a task has approved:
+
+| Tasks that reference the SHA | Check run |
+|---|---|
+| some task that approved it is back in `in_progress`, `blocked` or `todo` | `completed` / `failure` |
+| otherwise, some task that approved it is back in `in_review` | `in_progress` (re-review pending) |
+| otherwise, at least one task in `approved` or `merged` has it as `approved_sha` | `completed` / `success` |
+| otherwise (for example, every task that approved it was cancelled or approved a newer SHA) | `completed` / `neutral` |
+
+So a SHA is green only if a task currently approves it and no task that once approved it has taken that back. A task referencing several SHAs only counts for its latest approval. A new push changes the SHA, and the new SHA has no run, so the PR is blocked again until it is approved.
+
+Delivery uses an outbox. A task change only marks the SHA as dirty. A Durable Object alarm then computes the current desired state from all tasks and creates a new check run (GitHub uses the most recent run of that name). On an error it retries with backoff (1 s, 2 s, 4 s, … up to 1 h) until GitHub accepts it. Because it always sends the latest state, and a change during a send makes it send again, a slow or failed delivery can't leave an older "success" on top. The merge-time PR comparison stays on as an extra check. The old `GITHUB_COMMIT_STATUS` option has been removed: anyone with `statuses:write` could forge a commit status.
 
 Approve and merge wait on GitHub before saving. If the task changed meanwhile, the call is rejected with "task was modified during verification, please retry" instead of overwriting the newer state.
 
@@ -138,7 +155,7 @@ A changed tool is "live" only after **every** client type has actually called it
 
 ## Web UI
 
-When `OWNER_PASSWORD` is set, `https://<your-worker>/board` shows a read-only view of the board and the task table, behind the owner password. Sessions are HttpOnly, Secure and SameSite=Strict cookies that last 12 h. Failed logins are throttled per source network (IPv4 address, IPv6 /64); there is no board-wide lockout. For edge protection, add a Cloudflare WAF rate limiting rule on `POST /board/login` and `/authorize`. There is no write access from the web.
+When `OWNER_PASSWORD` is set, `https://<your-worker>/board` shows a read-only view of the board and the task table, behind the owner password. Sessions are HttpOnly, Secure and SameSite=Strict cookies that last 12 h. Failed logins are throttled per source network (IPv4 address, IPv6 /64); there is no board-wide lockout. For edge protection, add a Cloudflare WAF rate limiting rule on `POST /board/login` and `/authorize`. The WAF only works on a Cloudflare zone, so serve the board from a **custom domain** on a zone you own (`routes = [{ pattern = "board.example.com", custom_domain = true }]`) and set `workers_dev = false`. Traffic to `*.workers.dev` never passes your zone's WAF rules. There is no write access from the web.
 
 ## License
 

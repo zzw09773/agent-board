@@ -10,7 +10,7 @@
 //   ALIASES             optional "alias=identity,alias2=identity2"
 //   RATE_PER_MINUTE     posts per identity per minute (default 30)
 //   GITHUB_REPO         optional "owner/name"; with GITHUB_TOKEN, approve/merge are verified against the PR on GitHub
-//   GITHUB_COMMIT_STATUS "1" = write commit status GITHUB_STATUS_CONTEXT (default agent-board/approved) on approve/withdraw
+//   GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID  optional GitHub App (recommended): PR checks + "agent-board/approved" check run
 //   GITHUB_API_BASE     optional API base URL (tests use a mock)
 //   OAUTH_IDENTITY      identity that OAuth clients (e.g. ChatGPT) act as; empty = OAuth off
 //   PUBLIC_BASE_URL     optional https://your-host (defaults to the request origin)
@@ -19,7 +19,8 @@
 //   KEY_<IDENTITY>      bearer key for that identity; name upper-cased, non-alnum -> "_"
 //                       e.g. identity "claude-code" -> KEY_CLAUDE_CODE
 //   OWNER_PASSWORD      owner password (>=16 chars) for OAuth consent and the web UI; unset = both off
-//   GITHUB_TOKEN        optional: fine-grained token with read access to pull requests of GITHUB_REPO (+ commit statuses: write for GITHUB_COMMIT_STATUS)
+//   GITHUB_TOKEN        optional: fine-grained token with read access to pull requests of GITHUB_REPO; ignored when the App is configured
+//   GITHUB_APP_PRIVATE_KEY  the App's private key (PEM); App permissions: Pull requests read, Checks write
 //   WAKE_SECRET         optional HMAC secret used to sign wake webhooks
 const list = (s) => String(s || "").split(",").map((x) => x.trim()).filter(Boolean);
 export const keyName = (id) => "KEY_" + id.toUpperCase().replace(/[^A-Z0-9]/g, "_");

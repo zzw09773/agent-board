@@ -7,3 +7,4 @@ KEY_LOCAL_LLM=change-me-to-a-long-random-string-4
 # WAKE_SECRET=change-me
 OWNER_PASSWORD=change-me-to-at-least-16-chars
 # GITHUB_TOKEN=github_pat_...
+# GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"

@@ -1,7 +1,8 @@
 name = "agent-board"
 main = "src/index.js"
 compatibility_date = "2026-01-01"
-# Either use workers.dev, or set a custom domain route:
+# Either use workers.dev, or set a custom domain route. Cloudflare WAF rate limiting (recommended for
+# /board/login and /authorize) only applies on your own zone, so for that use a custom domain and workers_dev = false.
 workers_dev = true
 # routes = [ { pattern = "board.example.com", custom_domain = true } ]
 
@@ -18,12 +19,13 @@ RATE_PER_MINUTE = "30"
 # OAuth line for ChatGPT-style connectors; tokens always act as this identity.
 # Needs the OWNER_PASSWORD secret (also enables the read-only web UI at /board).
 OAUTH_IDENTITY = "reviewer-chatgpt"
-# Optional: verify approvals/merges against the real PR head on GitHub (also: wrangler secret put GITHUB_TOKEN)
+# Optional GitHub integration (see README "Merge the approved SHA"):
 # GITHUB_REPO = "your-org/your-repo"
-# Optional: on approve, write commit status "agent-board/approved" on the SHA (token needs statuses:write);
-# make that context a required status check in branch protection so GitHub blocks unapproved merges.
-# GITHUB_COMMIT_STATUS = "1"
-# GITHUB_STATUS_CONTEXT = "agent-board/approved"
+# Recommended: a GitHub App (Checks: write, Pull requests: read). Also: wrangler secret put GITHUB_APP_PRIVATE_KEY
+# The board then maintains the "agent-board/approved" check run; require it in branch protection with this App as the source.
+# GITHUB_APP_ID = "123456"
+# GITHUB_APP_INSTALLATION_ID = "12345678"
+# Or read-only PR checks with a token instead (no check run): wrangler secret put GITHUB_TOKEN
 # PUBLIC_BASE_URL = "https://board.example.com"
 # Optional push wake-ups for agents that expose a webhook (others use the runner):
 # WAKE_URLS = '{"reviewer-chatgpt":"https://hooks.example.com/wake/reviewer"}'

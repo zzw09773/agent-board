@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, generateKeyPairSync, verify as cryptoVerify } from "node:crypto";
 import { createServer } from "node:http";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -17,23 +17,50 @@ const PORT2 = PORT + 1, B2 = `http://127.0.0.1:${PORT2}`;           // second in
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Mock GitHub API: PRS[n] = { head, merged, merge_commit_sha }
 const PRS = {};
-// STATUSES[sha] = [{state, context}, ...] records commit statuses the board wrote. PRS[n].delay slows the PR lookup.
-const STATUSES = {};
+// Mock GitHub API with a GitHub App: the board must sign a JWT with the App key, exchange it for an
+// installation token, then use that token. CHECKS[sha] = check runs created, oldest first.
+// PRS[n].delay slows the PR lookup; GH.failChecks = N makes the next N check-run creations fail with 502;
+// GH.checkDelay slows check-run creation.
+const APP = generateKeyPairSync("rsa", { modulusLength: 2048 });
+const APP_PEM = APP.privateKey.export({ type: "pkcs1", format: "pem" }); // the format GitHub hands out
+const INST_TOKEN = "ghs_test_" + randomBytes(8).toString("hex");
+const CHECKS = {}, GH = { failChecks: 0, checkDelay: 0, tokenCalls: 0, badJwt: 0 };
+function jwtOk(h) {
+  const [hd, pl, sig] = String(h || "").replace(/^Bearer /, "").split(".");
+  if (!sig) return false;
+  const good = cryptoVerify("RSA-SHA256", Buffer.from(hd + "." + pl), APP.publicKey, Buffer.from(sig, "base64url"));
+  const c = JSON.parse(Buffer.from(pl, "base64url").toString());
+  return good && c.iss === "12345" && c.exp > Date.now() / 1000;
+}
 const gh = createServer((req, res) => {
-  if (req.headers.authorization !== "Bearer gh-test-token") { res.writeHead(401); return res.end("{}"); }
-  const st = req.url.match(/^\/repos\/test-org\/test-repo\/statuses\/([0-9a-f]+)$/);
-  if (st && req.method === "POST") {
-    let b = ""; req.on("data", (d) => (b += d));
-    return req.on("end", () => { const j = JSON.parse(b); (STATUSES[st[1]] ||= []).push({ state: j.state, context: j.context }); res.writeHead(201, { "content-type": "application/json" }); res.end("{}"); });
-  }
-  const m = req.url.match(/^\/repos\/test-org\/test-repo\/pulls\/(\d+)$/);
-  const pr = m && PRS[m[1]];
-  if (!pr) { res.writeHead(404); return res.end("{}"); }
-  setTimeout(() => {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ head: { sha: pr.head }, merged: pr.merged, merge_commit_sha: pr.merge_commit_sha || null }));
-  }, pr.delay || 0);
+  const send = (code, o) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+  let b = ""; req.on("data", (d) => (b += d));
+  req.on("end", () => {
+    if (req.method === "POST" && req.url === "/app/installations/777/access_tokens") {
+      if (!jwtOk(req.headers.authorization)) { GH.badJwt++; return send(401, {}); }
+      GH.tokenCalls++; return send(201, { token: INST_TOKEN, expires_at: new Date(Date.now() + 3600e3).toISOString() });
+    }
+    if (req.headers.authorization !== `Bearer ${INST_TOKEN}`) return send(401, {});
+    if (req.method === "POST" && req.url === "/repos/test-org/test-repo/check-runs") {
+      const j = JSON.parse(b);
+      return setTimeout(() => {
+        if (GH.failChecks > 0) { GH.failChecks--; return send(502, {}); }
+        (CHECKS[j.head_sha] ||= []).push({ name: j.name, status: j.status, conclusion: j.conclusion || null });
+        send(201, { id: Math.floor(Math.random() * 1e9) });
+      }, GH.checkDelay);
+    }
+    const m = req.url.match(/^\/repos\/test-org\/test-repo\/pulls\/(\d+)$/);
+    const pr = m && PRS[m[1]];
+    if (!pr) return send(404, {});
+    setTimeout(() => send(200, { head: { sha: pr.head }, merged: pr.merged, merge_commit_sha: pr.merge_commit_sha || null }), pr.delay || 0);
+  });
 });
+const last = (sha) => { const c = CHECKS[sha]; return c && c.length ? c.at(-1).conclusion || c.at(-1).status : undefined; };
+async function waitCheck(sha, want, ms = 15000) {
+  const t = Date.now();
+  while (Date.now() - t < ms) { if (last(sha) === want) { await sleep(1500); if (last(sha) === want) return; } await sleep(200); }
+  assert.equal(last(sha), want, `check run for ${sha.slice(0, 7)}: ${JSON.stringify(CHECKS[sha])}`);
+}
 const PW = "test-owner-password-123";
 const KEY = Object.fromEntries(["rev", "claude", "codex", "local", "noisy", "merger"].map((n) => [n, `test-key-${n}-${randomBytes(12).toString("hex")}`]));
 const SHA1 = "a".repeat(40), SHA2 = "b".repeat(40);
@@ -55,9 +82,9 @@ before(async () => {
   const keys = Object.entries(KEY).map(([n, k]) => `KEY_${n.toUpperCase()}=${k}`).join("\n");
   const env1 = join(tmp, "a.env"), env2 = join(tmp, "b.env");
   writeFileSync(env1, keys + `\nOWNER_PASSWORD=${PW}\n`);
-  writeFileSync(env2, keys + `\nOWNER_PASSWORD=${PW}\nGITHUB_TOKEN=gh-test-token\n`);
+  writeFileSync(env2, keys + `\nOWNER_PASSWORD=${PW}\nGITHUB_APP_PRIVATE_KEY="${APP_PEM.trim().replace(/\n/g, "\\n")}"\n`);
   dev = start(PORT, env1, [], "__log");
-  dev2 = start(PORT2, env2, ["--var", "GITHUB_REPO:test-org/test-repo", "--var", "GITHUB_COMMIT_STATUS:1", "--var", `GITHUB_API_BASE:http://127.0.0.1:${gh.address().port}`], "__log2");
+  dev2 = start(PORT2, env2, ["--var", "GITHUB_REPO:test-org/test-repo", "--var", "GITHUB_APP_ID:12345", "--var", "GITHUB_APP_INSTALLATION_ID:777", "--var", `GITHUB_API_BASE:http://127.0.0.1:${gh.address().port}`], "__log2");
   await ready(B, "__log"); await ready(B2, "__log2");
 });
 after(() => { if (process.env.SHOWLOG) console.log(globalThis.__log, globalThis.__log2); for (const p of [dev, dev2]) { try { process.kill(-p.pid); } catch {} } gh.close(); rmSync(tmp, { recursive: true, force: true }); });
@@ -303,21 +330,77 @@ test("bypass: race - approve in flight while the owner sends the task back (slow
   assert.equal(g.task.approved_sha, null);
   const statuses = g.history.map((h) => h.detail.status).filter(Boolean).map((x) => x[1]);
   assert.deepEqual(statuses.reverse(), ["todo", "in_progress", "in_review", "in_progress"], "history has no approval");
-  assert.equal(STATUSES[SR], undefined, "no success status was written for the rejected approval");
+  await sleep(1500);
+  assert.equal(CHECKS[SR], undefined, "no check run was created for the rejected approval");
 });
 
-test("GitHub commit status: approve writes success, withdrawing writes pending/failure", async () => {
+test("GitHub App check run: approve -> success, back to review -> in_progress, re-approve elsewhere, withdraw -> failure", async () => {
   const S3 = "d".repeat(40), S4 = "e".repeat(40);
   const id = await ghTask(12); PRS[12] = { head: S3, merged: false };
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S3 }, B2));
-  assert.deepEqual(STATUSES[S3], [{ state: "success", context: "agent-board/approved" }]);
+  const r = ok(await call("rev", "task_update", { id, status: "approved", head_sha: S3 }, B2));
+  assert.deepEqual(r.github_check, [{ sha: S3, check: "agent-board/approved", desired: "success", delivery: "queued" }]);
+  await waitCheck(S3, "success");
+  assert.equal(CHECKS[S3][0].name, "agent-board/approved");
   ok(await call("claude", "task_update", { id, status: "in_review" }, B2));
-  assert.deepEqual(STATUSES[S3].at(-1), { state: "pending", context: "agent-board/approved" });
+  await waitCheck(S3, "in_progress");
   PRS[12] = { head: S4, merged: false };
   ok(await call("rev", "task_update", { id, status: "approved", head_sha: S4 }, B2));
-  assert.deepEqual(STATUSES[S4], [{ state: "success", context: "agent-board/approved" }]);
+  await waitCheck(S4, "success");
+  await waitCheck(S3, "neutral");                        // nobody vouches for the old SHA any more
   ok(await call("claude", "task_update", { id, status: "in_progress" }, B2));
-  assert.deepEqual(STATUSES[S4].at(-1), { state: "failure", context: "agent-board/approved" });
+  await waitCheck(S4, "failure");
+  assert.ok(GH.tokenCalls >= 1 && GH.tokenCalls <= 2, "installation token is cached, got " + GH.tokenCalls);
+  assert.equal(GH.badJwt, 0);
+});
+
+test("outbox: check-run delivery retries after 5xx and ends in the correct state", async () => {
+  const S5 = "1".repeat(40);
+  const id = await ghTask(13); PRS[13] = { head: S5, merged: false };
+  GH.failChecks = 3;
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S5 }, B2));
+  await sleep(500);
+  assert.equal(CHECKS[S5], undefined, "first attempts failed");
+  await waitCheck(S5, "success", 20000);
+  assert.equal(GH.failChecks, 0);
+  assert.equal(CHECKS[S5].length, 1);
+});
+
+test("bypass: approve then withdraw, with the approve delivery slow or failing, never ends on success", async () => {
+  const S6 = "2".repeat(40), S7 = "3".repeat(40);
+  // (a) approve's check run is in flight (slow GitHub) when the owner withdraws
+  let id = await ghTask(14); PRS[14] = { head: S6, merged: false };
+  GH.checkDelay = 1500;
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S6 }, B2));
+  await sleep(300);
+  ok(await call("claude", "task_update", { id, status: "in_progress", note: "bug" }, B2));
+  GH.checkDelay = 0;
+  await waitCheck(S6, "failure", 20000);
+  // (b) approve's delivery fails, withdraw happens before the retry: only the latest state is sent
+  id = await ghTask(15); PRS[15] = { head: S7, merged: false };
+  GH.failChecks = 1;
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S7 }, B2));
+  ok(await call("claude", "task_update", { id, status: "blocked" }, B2));
+  await waitCheck(S7, "failure", 20000);
+  assert.ok(!CHECKS[S7].some((c) => c.conclusion === "success"), "a stale success was never sent: " + JSON.stringify(CHECKS[S7]));
+});
+
+test("same SHA on several tasks: success needs a current approval and no task that withdrew it", async () => {
+  const X = "4".repeat(40);
+  PRS[16] = { head: X, merged: false }; PRS[17] = { head: X, merged: false };
+  const a = await ghTask(16), b = await ghTask(17);
+  ok(await call("rev", "task_update", { id: a, status: "approved", head_sha: X }, B2));
+  ok(await call("rev", "task_update", { id: b, status: "approved", head_sha: X }, B2));
+  await waitCheck(X, "success");
+  ok(await call("claude", "task_update", { id: b, status: "in_progress", note: "this SHA breaks task b" }, B2));
+  await waitCheck(X, "failure");                         // a still approves it, but b took it back
+  ok(await call("claude", "task_update", { id: b, status: "in_review" }, B2));
+  await waitCheck(X, "in_progress");                     // b is being re-reviewed
+  ok(await call("rev", "task_update", { id: b, status: "approved", head_sha: X }, B2));
+  await waitCheck(X, "success");
+  ok(await call("claude", "task_update", { id: b, status: "cancelled" }, B2));
+  await waitCheck(X, "success");                         // a cancelled task stops blocking; a still approves
+  ok(await call("claude", "task_update", { id: a, status: "cancelled" }, B2));
+  await waitCheck(X, "neutral");                         // nobody approves it any more
 });
 
 test("unit: source keys are /32 for IPv4 and /64 for IPv6; password minimum is 16", async () => {

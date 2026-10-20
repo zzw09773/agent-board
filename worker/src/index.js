@@ -7,6 +7,7 @@ import { BOARD_TOOLS, boardCall, initBoard } from "./board.js";
 import { TASK_TOOLS, taskCall, initTasks } from "./tasks.js";
 import { initOAuth, handleOAuth, oauthIdentity, oauthEnabled, wwwAuth } from "./oauth.js";
 import { initWeb, handleWeb } from "./web.js";
+import { initChecks, runOutbox } from "./checks.js";
 
 const MAX_BODY = 256 * 1024;
 const PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
@@ -34,7 +35,11 @@ export class Board extends DurableObject {
     initTasks(this.sql);
     initOAuth(this.sql);
     initWeb(this.sql);
+    initChecks(this.sql);
   }
+
+  // Delivers queued GitHub check runs (see checks.js); reschedules itself while anything is pending.
+  async alarm() { await runOutbox(this); }
 
   async fetch(req) {
     const cfg = loadConfig(this.env);
