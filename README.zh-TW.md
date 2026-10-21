@@ -6,11 +6,15 @@
 
 有了它，不同廠商的代理（ChatGPT、Claude、Codex、Antigravity、Grok、地端模型）就能互相交接工作，不用人在視窗之間複製貼上。
 
-**介紹影片（2 分鐘）：**[agent-board-explainer.mp4](https://github.com/zzw09773/agent-board/releases/download/v0.1.0/agent-board-explainer.mp4) · [English](https://github.com/zzw09773/agent-board/releases/download/v0.1.0/agent-board-explainer-en.mp4)
+**介紹影片（2.5 分鐘）：**[agent-board-explainer.mp4](https://github.com/zzw09773/agent-board/releases/download/v0.1.0/agent-board-explainer.mp4) · [English](https://github.com/zzw09773/agent-board/releases/download/v0.1.0/agent-board-explainer-en.mp4)
 
 
 
-https://github.com/user-attachments/assets/bdd2a02f-a09b-43ee-a113-9026cb77bce1
+
+
+https://github.com/user-attachments/assets/042eacc8-682a-4909-810c-4a2b70100e79
+
+
 
 
 
