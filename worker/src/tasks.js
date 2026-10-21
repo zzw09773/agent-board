@@ -6,7 +6,7 @@ import { githubEnabled, prNumber, fetchPr } from "./github.js";
 import { markDirty, checkInfo } from "./checks.js";
 
 export const STATUSES = ["todo", "in_progress", "in_review", "approved", "merged", "blocked", "cancelled"];
-const LOCKING = ["in_progress", "in_review"]; // states that hold the mainline lock
+const LOCKING = ["in_review", "approved"]; // states that hold the mainline lock (review through merge)
 const DONE = ["merged", "cancelled"];
 const LEVELS = ["test", "sensitive"];
 const now = () => new Date().toISOString();
@@ -23,7 +23,7 @@ const rule = (m) => new RuleError(m);
 const row = (r) => r && { id: r.id, seq: r.seq, title: r.title, description: r.description, owner: r.owner, reviewer: r.reviewer, status: r.status, next_owner: r.next_owner, links: JSON.parse(r.links || "{}"), touches_mainline: !!r.touches_mainline, data_level: r.data_level, approved_sha: r.approved_sha || null, check_sha: r.check_sha || null, created_by: r.created_by, created_at: r.created_at, updated_at: r.updated_at };
 const pub = (t) => { if (!t) return t; const { seq, ...o } = t; return o; };
 const get = (self, id) => row(self.sql.exec("SELECT * FROM tasks WHERE id=?", String(id || "").trim().toUpperCase()).toArray()[0]);
-const lockHolder = (self, except) => row(self.sql.exec("SELECT * FROM tasks WHERE touches_mainline=1 AND status IN ('in_progress','in_review') AND id<>? LIMIT 1", except || "").toArray()[0]) || null;
+const lockHolder = (self, except) => row(self.sql.exec("SELECT * FROM tasks WHERE touches_mainline=1 AND status IN ('in_review','approved') AND id<>? LIMIT 1", except || "").toArray()[0]) || null;
 const okUrl = (u) => { try { return ["http:", "https:"].includes(new URL(String(u)).protocol); } catch { return false; } };
 
 function mergeLinks(cur, add) {
@@ -71,7 +71,7 @@ function check(self, cfg, t, prev, actor) {
   }
   if (t.touches_mainline && LOCKING.includes(t.status)) {
     const h = lockHolder(self, t.id);
-    if (h) throw rule(`mainline lock held by ${h.id} "${h.title}" (${h.status}, owner ${h.owner}). Only one mainline task may be in_progress/in_review at a time.`);
+    if (h) throw rule(`mainline lock held by ${h.id} "${h.title}" (${h.status}, owner ${h.owner}). Only one mainline task may be in_review/approved (review through merge) at a time; several may be in_progress in their own worktrees. Wait until it is merged or cancelled before requesting review, and sync to latest main before requesting review.`);
   }
 }
 
@@ -162,9 +162,9 @@ export function TASK_TOOLS(cfg) {
   return [
     { name: "task_new", title: "New task", annotations: rw, description: "Create a task (starts as todo). Setting next_owner wakes them via the board.",
       inputSchema: S({ title: { type: "string" }, description: { type: "string" }, owner: id, reviewer: id, next_owner: id, touches_mainline: { type: "boolean", default: false }, data_level: { type: "string", enum: LEVELS, default: "test" }, links, note: { type: "string" } }, ["title"]) },
-    { name: "task_claim", title: "Claim task", annotations: rw, description: "Become owner and move todo/blocked -> in_progress. Mainline tasks need the mainline lock.",
+    { name: "task_claim", title: "Claim task", annotations: rw, description: "Become owner and move todo/blocked -> in_progress. Several mainline tasks may be in_progress at once (each in its own worktree); the mainline lock is taken only when requesting review.",
       inputSchema: S({ id: { type: "string" }, note: { type: "string" } }, ["id"]) },
-    { name: "task_update", title: "Update task", annotations: rw, description: `Update status (${STATUSES.join("/")}), owner, reviewer, next_owner, links, note. Only the owner, reviewer or an approver may update (a merger may only merge). Rules: approved only from in_review by the reviewer, with head_sha${cfg.approvers.length ? " (one of " + cfg.approvers.join(", ") + ")" : ""}; merged only from approved with the same head_sha; only an approver can lower data_level, clear touches_mainline or change the reviewer; only owner/approver can reassign or cancel; reviewer != owner; one mainline task in flight; sensitive data only for allowlisted owners.`,
+    { name: "task_update", title: "Update task", annotations: rw, description: `Update status (${STATUSES.join("/")}), owner, reviewer, next_owner, links, note. Only the owner, reviewer or an approver may update (a merger may only merge). Rules: approved only from in_review by the reviewer, with head_sha${cfg.approvers.length ? " (one of " + cfg.approvers.join(", ") + ")" : ""}; merged only from approved with the same head_sha; only an approver can lower data_level, clear touches_mainline or change the reviewer; only owner/approver can reassign or cancel; reviewer != owner; only one mainline task in_review/approved at a time (several may be in_progress; sync to latest main before requesting review); sensitive data only for allowlisted owners.`,
       inputSchema: S({ id: { type: "string" }, status: { type: "string", enum: STATUSES }, owner: id, reviewer: id, next_owner: id, title: { type: "string" }, description: { type: "string" }, touches_mainline: { type: "boolean" }, data_level: { type: "string", enum: LEVELS }, head_sha: { type: "string", description: "commit SHA: required when approving (the reviewed commit) and when merging (must match)" }, links, note: { type: "string" } }, ["id"]) },
     { name: "task_list", title: "List tasks", annotations: ro, description: "List tasks (open ones by default). Filters: status, owner, next_owner, mine, include_closed.",
       inputSchema: S({ status: { type: "string", enum: STATUSES }, owner: { type: "string" }, next_owner: { type: "string" }, mine: { type: "boolean" }, include_closed: { type: "boolean", default: false }, limit: { type: "integer", default: 50, minimum: 1, maximum: 200 } }) },

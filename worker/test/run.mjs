@@ -178,9 +178,52 @@ test("bypass: clear touches_mainline to dodge the mainline lock", async () => {
   const a = await newTask("claude", { owner: "claude", touches_mainline: true });
   ok(await call("claude", "task_claim", { id: a }));
   const b = await newTask("codex", { owner: "codex", touches_mainline: true });
-  no(await call("codex", "task_claim", { id: b }), /mainline lock/);
-  no(await call("codex", "task_update", { id: b, touches_mainline: false, status: "in_progress" }), /only an approver can clear touches_mainline/);
+  ok(await call("codex", "task_claim", { id: b })); // several mainline tasks may be in_progress
+  ok(await call("claude", "task_update", { id: a, status: "in_review" })); // takes the lock
+  no(await call("codex", "task_update", { id: b, status: "in_review" }), /mainline lock/);
+  no(await call("codex", "task_update", { id: b, touches_mainline: false, status: "in_review" }), /only an approver can clear touches_mainline/);
   ok(await call("claude", "task_update", { id: a, status: "cancelled" })); // release lock
+  ok(await call("codex", "task_update", { id: b, status: "cancelled" }));
+});
+
+// Mainline lock: held only from in_review through merge; several mainline tasks may be in_progress.
+const mt = async (who) => { const id = await newTask(who, { owner: who, reviewer: "rev", touches_mainline: true }); ok(await call(who, "task_claim", { id })); return id; };
+const lockOf = async () => (await call("rev", "task_list", {})).mainline_lock;
+test("mainline lock: two mainline tasks may both be in_progress", async () => {
+  const a = await mt("claude"), b = await mt("codex");
+  assert.equal((await call("codex", "task_get", { id: b })).task.status, "in_progress");
+  assert.equal(await lockOf(), null);
+  ok(await call("claude", "task_update", { id: a, status: "cancelled" })); ok(await call("codex", "task_update", { id: b, status: "cancelled" }));
+});
+test("mainline lock: second in_review blocked while first is in_review", async () => {
+  const a = await mt("claude"), b = await mt("codex");
+  ok(await call("claude", "task_update", { id: a, status: "in_review" }));
+  no(await call("codex", "task_update", { id: b, status: "in_review" }), /mainline lock held by .*sync to latest main/);
+  assert.equal((await call("codex", "task_get", { id: b })).task.status, "in_progress");
+  assert.equal((await lockOf()).id, a);
+  ok(await call("claude", "task_update", { id: a, status: "cancelled" })); ok(await call("codex", "task_update", { id: b, status: "cancelled" }));
+});
+test("mainline lock: blocked while first is approved", async () => {
+  const a = await mt("claude"), b = await mt("codex");
+  ok(await call("claude", "task_update", { id: a, status: "in_review" }));
+  ok(await call("rev", "task_update", { id: a, status: "approved", head_sha: SHA1 }));
+  no(await call("codex", "task_update", { id: b, status: "in_review" }), /mainline lock/);
+  ok(await call("rev", "task_update", { id: a, status: "cancelled" })); ok(await call("codex", "task_update", { id: b, status: "cancelled" }));
+});
+test("mainline lock: released after merge", async () => {
+  const a = await mt("claude"), b = await mt("claude");
+  ok(await call("claude", "task_update", { id: a, status: "in_review" }));
+  ok(await call("rev", "task_update", { id: a, status: "approved", head_sha: SHA1 }));
+  ok(await call("merger", "task_update", { id: a, status: "merged", head_sha: SHA1 }));
+  ok(await call("claude", "task_update", { id: b, status: "in_review" }));
+  ok(await call("claude", "task_update", { id: b, status: "cancelled" }));
+});
+test("mainline lock: released after cancel", async () => {
+  const a = await mt("claude"), b = await mt("codex");
+  ok(await call("claude", "task_update", { id: a, status: "in_review" }));
+  ok(await call("claude", "task_update", { id: a, status: "cancelled" }));
+  ok(await call("codex", "task_update", { id: b, status: "in_review" }));
+  ok(await call("codex", "task_update", { id: b, status: "cancelled" }));
 });
 
 test("bypass: cancel or reassign someone else's task", async () => {
