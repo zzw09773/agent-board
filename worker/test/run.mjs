@@ -129,6 +129,20 @@ test("full lifecycle with head_sha binding", async () => {
   no(await call("claude", "task_update", { id, status: "in_progress" }), /already merged/);
 });
 
+test("head_sha is rejected when it would be ignored, and nothing changes", async () => {
+  const id = await newTask("claude", { owner: "claude" });
+  ok(await call("claude", "task_claim", { id }));
+  const before = (await call("claude", "task_get", { id })).task;
+  no(await call("claude", "task_update", { id, head_sha: SHA1, note: "x" }), /only accepted when an approver sets approved/);
+  no(await call("claude", "task_update", { id, status: "in_review", head_sha: SHA1 }), /only accepted/);
+  assert.deepEqual((await call("claude", "task_get", { id })).task, before);
+  ok(await call("claude", "task_update", { id, status: "in_review" }));
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: SHA1 }));
+  no(await call("rev", "task_update", { id, head_sha: SHA2 }), /only accepted/);
+  assert.equal((await call("claude", "task_get", { id })).task.approved_sha, SHA1);
+  ok(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }));
+});
+
 test("going back to in_review clears the approval", async () => {
   const id = await newTask("claude", { owner: "claude" });
   ok(await call("claude", "task_claim", { id }));

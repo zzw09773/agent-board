@@ -225,7 +225,8 @@ export async function taskCall(self, cfg, actor, name, a) {
         if (a.data_level != null) t.data_level = a.data_level;
         t.links = mergeLinks(t.links, a.links);
         if (a.status === "in_review" && a.next_owner === undefined) t.next_owner = t.reviewer;
-        if (a.head_sha !== undefined) { const h = normSha(a.head_sha); if (h && !SHA.test(h)) throw rule("head_sha must be a full 40- or 64-char hex commit SHA"); t._head_sha = h; }
+        if (a.head_sha !== undefined) { const h = normSha(a.head_sha); if (h && !SHA.test(h)) throw rule("head_sha must be a full 40- or 64-char hex commit SHA"); t._head_sha = h;
+          if (h && !(prev.status !== t.status && (t.status === "approved" || t.status === "merged"))) throw rule(`head_sha is only accepted when an approver sets approved, or when merging (this call is ${prev.status} -> ${t.status}, so it would not be stored); nothing was changed, drop head_sha and resend`); }
         if (t.status === "approved" && prev.status !== "approved") { t.approved_sha = t._head_sha || null; t.check_sha = t.approved_sha; }
         if (["in_progress", "in_review", "todo", "blocked"].includes(t.status)) t.approved_sha = null;
         if (a.status === "approved" && a.next_owner === undefined) t.next_owner = cfg.mergers[0] || t.owner;
