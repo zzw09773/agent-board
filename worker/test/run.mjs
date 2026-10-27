@@ -16,7 +16,7 @@ const B = `http://127.0.0.1:${PORT}`;
 const PORT2 = PORT + 1, B2 = `http://127.0.0.1:${PORT2}`;           // second instance: GitHub binding on, short password
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Mock GitHub API: PRS[n] = { head, merged, merge_commit_sha }
-const PRS = {};
+const PRS = {}, CI = {};
 // Mock GitHub API with a GitHub App: the board must sign a JWT with the App key, exchange it for an
 // installation token, then use that token. CHECKS[sha] = check runs created, oldest first.
 // PRS[n].delay slows the PR lookup; GH.failChecks = N makes the next N check-run creations fail with 502;
@@ -50,10 +50,18 @@ const gh = createServer((req, res) => {
         send(201, { id: Math.floor(Math.random() * 1e9) });
       }, GH.checkDelay);
     }
+    const url = new URL(req.url, "http://localhost");
+    const cm = url.pathname.match(/^\/repos\/test-org\/test-repo\/commits\/([0-9a-f]+)\/check-runs$/);
+    if (cm) {
+      const sha = cm[1];
+      const runs = CI[sha] ?? [{ id: 101, head_sha: sha, name: "CI", app: { id: 99 }, status: "completed", conclusion: "success" }];
+      if (typeof runs === "number") return send(runs, {});
+      return send(200, { total_count: runs.length, check_runs: runs });
+    }
     const m = req.url.match(/^\/repos\/test-org\/test-repo\/pulls\/(\d+)$/);
     const pr = m && PRS[m[1]];
     if (!pr) return send(404, {});
-    setTimeout(() => send(200, { head: { sha: pr.head }, merged: pr.merged, merge_commit_sha: pr.merge_commit_sha || null }), pr.delay || 0);
+    setTimeout(() => send(200, { head: { sha: pr.head }, merged: pr.merged, state: pr.state || (pr.merged ? "closed" : "open"), merge_commit_sha: pr.merge_commit_sha || null }), pr.delay || 0);
   });
 });
 const last = (sha) => { const c = CHECKS[sha]; return c && c.length ? c.at(-1).conclusion || c.at(-1).status : undefined; };
@@ -85,7 +93,7 @@ before(async () => {
   writeFileSync(env1, keys + `\nOWNER_PASSWORD=${PW}\n`);
   writeFileSync(env2, keys + `\nOWNER_PASSWORD=${PW}\nGITHUB_APP_PRIVATE_KEY="${APP_PEM.trim().replace(/\n/g, "\\n")}"\n`);
   dev = start(PORT, env1, [], "__log");
-  dev2 = start(PORT2, env2, ["--var", "GITHUB_REPO:test-org/test-repo", "--var", "GITHUB_APP_ID:12345", "--var", "GITHUB_APP_INSTALLATION_ID:777", "--var", `GITHUB_API_BASE:http://127.0.0.1:${gh.address().port}`], "__log2");
+  dev2 = start(PORT2, env2, ["--var", "QA_REVIEWERS:local", "--var", "RELEASE_APPROVERS:merger", "--var", 'REQUIRED_CI_CHECKS:[{"name":"CI","app_id":99}]', "--var", "GITHUB_REPO:test-org/test-repo", "--var", "GITHUB_APP_ID:12345", "--var", "GITHUB_APP_INSTALLATION_ID:777", "--var", `GITHUB_API_BASE:http://127.0.0.1:${gh.address().port}`], "__log2");
   await ready(B, "__log"); await ready(B2, "__log2");
 });
 after(() => { if (process.env.SHOWLOG) console.log(globalThis.__log, globalThis.__log2); for (const p of [dev, dev2]) { try { process.kill(-p.pid); } catch {} } gh.close(); rmSync(tmp, { recursive: true, force: true }); });
@@ -125,8 +133,9 @@ test("full lifecycle with head_sha binding", async () => {
   no(await call("claude", "task_update", { id, status: "merged", head_sha: SHA1 }), /only merger, codex can merge/);
   no(await call("merger", "task_update", { id, status: "merged" }), /head_sha/);
   no(await call("merger", "task_update", { id, status: "merged", head_sha: SHA2 }), /does not match/); // new commit after approval
-  ok(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }));
-  no(await call("claude", "task_update", { id, status: "in_progress" }), /already merged/);
+  no(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }), /QA and release/);
+  ok(await call("claude", "task_update", { id, status: "cancelled" }));
+  no(await call("claude", "task_update", { id, status: "in_progress" }), /already cancelled/);
 });
 
 test("head_sha is rejected when it would be ignored, and nothing changes", async () => {
@@ -140,7 +149,7 @@ test("head_sha is rejected when it would be ignored, and nothing changes", async
   ok(await call("rev", "task_update", { id, status: "approved", head_sha: SHA1 }));
   no(await call("rev", "task_update", { id, head_sha: SHA2 }), /only accepted/);
   assert.equal((await call("claude", "task_get", { id })).task.approved_sha, SHA1);
-  ok(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }));
+  no(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }), /QA and release/);
 });
 
 test("going back to in_review clears the approval", async () => {
@@ -210,11 +219,13 @@ test("mainline lock: blocked while first is approved", async () => {
   no(await call("codex", "task_update", { id: b, status: "in_review" }), /mainline lock/);
   ok(await call("rev", "task_update", { id: a, status: "cancelled" })); ok(await call("codex", "task_update", { id: b, status: "cancelled" }));
 });
-test("mainline lock: released after merge", async () => {
+test("mainline lock: missing gates keep the lock until cancellation", async () => {
   const a = await mt("claude"), b = await mt("claude");
   ok(await call("claude", "task_update", { id: a, status: "in_review" }));
   ok(await call("rev", "task_update", { id: a, status: "approved", head_sha: SHA1 }));
-  ok(await call("merger", "task_update", { id: a, status: "merged", head_sha: SHA1 }));
+  no(await call("merger", "task_update", { id: a, status: "merged", head_sha: SHA1 }), /QA and release/);
+  no(await call("claude", "task_update", { id: b, status: "in_review" }), /mainline lock/);
+  ok(await call("claude", "task_update", { id: a, status: "cancelled" }));
   ok(await call("claude", "task_update", { id: b, status: "in_review" }));
   ok(await call("claude", "task_update", { id: b, status: "cancelled" }));
 });
@@ -327,7 +338,7 @@ test("bypass: owner who is also a merger cannot merge their own task", async () 
   ok(await call("codex", "task_update", { id, status: "in_review" }));
   ok(await call("rev", "task_update", { id, status: "approved", head_sha: SHA1 }));
   no(await call("codex", "task_update", { id, status: "merged", head_sha: SHA1 }), /owner cannot merge/);
-  ok(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }));
+  no(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }), /QA and release/);
 });
 
 test("bypass: non-approver cannot pick a friendly reviewer in task_new", async () => {
@@ -349,6 +360,13 @@ const ghTask = async (pr) => {
   ok(await call("claude", "task_claim", { id }, B2)); ok(await call("claude", "task_update", { id, status: "in_review" }, B2));
   return id;
 };
+const qa = (id, sha, passed = true) => call("local", "task_attest", { id, kind: "qa", head_sha: sha, passed }, B2);
+const release = (id, sha, passed = true) => call("merger", "task_attest", { id, kind: "release", head_sha: sha, passed }, B2);
+async function approveReady(id, sha) {
+  const r = ok(await call("rev", "task_update", { id, status: "approved", head_sha: sha }, B2));
+  ok(await qa(id, sha));
+  return ok(await release(id, sha));
+}
 test("GitHub binding: approve must match the real PR head", async () => {
   no(await call("rev", "task_update", { id: await ghTask(null), status: "approved", head_sha: SHA1 }, B2), /add links.prs/);
   PRS[7] = { head: SHA2, merged: false };
@@ -360,12 +378,132 @@ test("GitHub binding: approve must match the real PR head", async () => {
 test("bypass: GitHub binding refuses a merge of anything but the approved SHA", async () => {
   PRS[8] = { head: SHA1, merged: false };
   const id = await ghTask(8);
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: SHA1 }, B2));
+  await approveReady(id, SHA1);
   no(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }, B2), /not merged on GitHub/);
   PRS[8] = { head: SHA2, merged: true, merge_commit_sha: "c".repeat(40) };       // new commit pushed, then branch merged
   no(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }, B2), /not the approved/);
   PRS[8] = { head: SHA1, merged: true, merge_commit_sha: SHA1 };                 // ff-only merge of the approved SHA
   ok(await call("merger", "task_update", { id, status: "merged", head_sha: SHA1 }, B2));
+  const g = await call("rev", "task_get", { id }, B2);
+  assert.deepEqual(g.audit.map((e) => [e.action, e.actor, e.sha]).reverse(), [
+    ["approved", "rev", SHA1], ["qa_passed", "local", SHA1], ["release_passed", "merger", SHA1], ["merged", "merger", SHA1],
+  ]);
+  assert.ok(g.audit.every((e) => Number.isFinite(Date.parse(e.at))));
+  assert.equal(g.audit[0].detail.ci[0].run_id, 101);
+  no(await call("claude", "task_update", { id, status: "in_progress" }, B2), /already merged/);
+});
+
+test("merge gates: review alone stays pending; untrusted callers and stale SHAs cannot attest", async () => {
+  const S = "ab".repeat(20); PRS[101] = { head: S, merged: false };
+  const id = await ghTask(101);
+  const ap = ok(await call("rev", "task_update", { id, status: "approved", head_sha: S, qa_sha: S, release_sha: S }, B2));
+  assert.equal(ap.task.qa_sha, null); assert.equal(ap.task.release_sha, null);
+  assert.equal(ap.github_check[0].desired, "in_progress");
+  no(await call("claude", "task_attest", { id, kind: "qa", head_sha: S, passed: true }, B2), /configured qa/);
+  no(await call("rev", "task_attest", { id, kind: "qa", head_sha: S, passed: true }, B2), /configured qa/);
+  no(await call("local", "task_attest", { id, kind: "qa", head_sha: SHA2, passed: true }, B2), /approved head_sha/);
+  no(await call("local", "task_attest", { id, kind: "qa", head_sha: S, passed: "true" }, B2), /passed must be boolean/);
+  no(await release(id, S), /requires QA/);
+  ok(await qa(id, S));
+  no(await call("rev", "task_attest", { id, kind: "release", head_sha: S, passed: true }, B2), /configured release/);
+  no(await call("merger", "task_update", { id, status: "merged", head_sha: S }, B2), /QA and release/);
+  PRS[101].head = SHA2;
+  no(await release(id, S), /current open PR head/);
+  PRS[101].head = S; PRS[101].state = "closed";
+  no(await release(id, S), /current open PR head/);
+  PRS[101].state = "open";
+  ok(await release(id, S));
+  no(await call("rev", "task_update", { id, links: { prs: ["https://github.com/test-org/test-repo/pull/102"] } }, B2), /return to in_review/);
+  ok(await qa(id, S, false));
+  const g = await call("rev", "task_get", { id }, B2);
+  assert.equal(g.task.release_sha, null);
+  assert.equal(g.github_check[0].desired, "in_progress");
+  no(await release(id, S), /requires QA/);
+});
+
+test("merge gates: every required CI run must succeed on the exact SHA from the expected App", async () => {
+  const S = "ac".repeat(20); PRS[102] = { head: S, merged: false };
+  const id = await ghTask(102);
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S }, B2)); ok(await qa(id, S));
+  const good = { id: 222, head_sha: S, name: "CI", app: { id: 99 }, status: "completed", conclusion: "success" };
+  for (const runs of [[], [{ ...good, app: { id: 98 } }], [{ ...good, head_sha: SHA1 }], [{ ...good, name: "fake" }],
+    [{ ...good, status: "in_progress" }], ...["failure", "neutral", "skipped", "cancelled", "timed_out"].map((conclusion) => [{ ...good, conclusion }]),
+    [good, { ...good, id: 223, conclusion: "failure" }]]) {
+    CI[S] = runs;
+    no(await release(id, S), /CI .*missing, incomplete, or not successful/);
+    assert.equal((await call("rev", "task_get", { id }, B2)).task.release_sha, null);
+  }
+  CI[S] = 503; no(await release(id, S), /GitHub API 503/);
+  CI[S] = [good]; ok(await release(id, S));
+  PRS[102].merged = true;
+  CI[S] = [{ ...good, conclusion: "failure" }];
+  no(await call("merger", "task_update", { id, status: "merged", head_sha: S }, B2), /CI .*not successful/);
+  assert.equal((await call("rev", "task_get", { id }, B2)).task.status, "approved");
+  CI[S] = [good]; ok(await call("merger", "task_update", { id, status: "merged", head_sha: S }, B2));
+});
+
+test("race: release cannot overwrite a concurrent QA revocation or a same-SHA review cycle", async () => {
+  const S = "ad".repeat(20); PRS[103] = { head: S, merged: false };
+  const id = await ghTask(103);
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S }, B2)); ok(await qa(id, S));
+  PRS[103].delay = 1500;
+  let pending = release(id, S); await sleep(300); ok(await qa(id, S, false));
+  no(await pending, /modified during verification/);
+  assert.equal((await call("rev", "task_get", { id }, B2)).task.release_sha, null);
+  PRS[103].delay = 0; ok(await qa(id, S));
+  PRS[103].delay = 1500; pending = release(id, S); await sleep(300);
+  ok(await call("claude", "task_update", { id, status: "in_review" }, B2));
+  PRS[103].delay = 0;
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S }, B2)); ok(await qa(id, S));
+  no(await pending, /modified during verification/);
+  const g = await call("rev", "task_get", { id }, B2);
+  assert.equal(g.task.release_sha, null);
+  assert.equal(g.audit.filter((e) => e.action === "release_passed").length, 0);
+});
+
+test("race: approval rechecks the mainline lock after GitHub returns", async () => {
+  const S = "af".repeat(20); PRS[105] = { head: S, merged: false, delay: 1500 };
+  const a = await ghTask(105);
+  const b = await newTask("rev", { owner: "claude", touches_mainline: true }, B2);
+  ok(await call("claude", "task_claim", { id: b }, B2));
+  const pending = call("rev", "task_update", { id: a, status: "approved", head_sha: S, touches_mainline: true }, B2);
+  await sleep(300);
+  ok(await call("claude", "task_update", { id: b, status: "in_review" }, B2));
+  no(await pending, /mainline lock held/);
+  const g = await call("rev", "task_get", { id: a }, B2);
+  assert.equal(g.task.status, "in_review"); assert.equal(g.audit.length, 0);
+  assert.equal((await call("rev", "task_list", {}, B2)).mainline_lock.id, b);
+  ok(await call("claude", "task_update", { id: b, status: "cancelled" }, B2));
+});
+
+test("gate identities must be independent, and absent role configuration cannot attest", async () => {
+  const S = "b0".repeat(20); PRS[106] = { head: S, merged: false };
+  const id = await newTask("rev", { owner: "local", links: { prs: ["https://github.com/test-org/test-repo/pull/106"] } }, B2);
+  ok(await call("local", "task_claim", { id }, B2)); ok(await call("local", "task_update", { id, status: "in_review" }, B2));
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S }, B2));
+  no(await qa(id, S), /independent identity/);
+  const standalone = await newTask("claude", { owner: "claude" });
+  ok(await call("claude", "task_claim", { id: standalone })); ok(await call("claude", "task_update", { id: standalone, status: "in_review" }));
+  ok(await call("rev", "task_update", { id: standalone, status: "approved", head_sha: S }));
+  no(await call("local", "task_attest", { id: standalone, kind: "qa", head_sha: S, passed: true }), /configured qa/);
+  no(await call("merger", "task_attest", { id: standalone, kind: "release", head_sha: S, passed: true }), /configured release/);
+});
+
+test("audit pagination retains duplicate attestations and denied calls add no audit events", async () => {
+  const S = "ae".repeat(20); PRS[104] = { head: S, merged: false };
+  const id = await ghTask(104);
+  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S }, B2));
+  for (let i = 0; i < 52; i++) ok(await qa(id, S));
+  let g = await call("rev", "task_get", { id }, B2);
+  assert.equal(g.audit.length, 50); assert.ok(g.next_audit_before);
+  const events = [...g.audit];
+  g = await call("rev", "task_get", { id, before_audit_id: g.next_audit_before }, B2);
+  events.push(...g.audit); assert.equal(events.length, 53); assert.equal(g.next_audit_before, null);
+  assert.equal(new Set(events.map((e) => e.id)).size, 53);
+  assert.equal(events.at(-1).action, "approved");
+  no(await release(id, SHA2), /approved head_sha/);
+  no(await call("rev", "task_get", { id, before_audit_id: "x" }, B2), /positive integer/);
+  assert.equal((await call("rev", "task_get", { id }, B2)).audit[0].id, events[0].id);
 });
 
 test("no board-wide lockout: a distributed flood does not slow the owner down", async () => {
@@ -395,14 +533,14 @@ test("bypass: race - approve in flight while the owner sends the task back (slow
 test("GitHub App check run: approve -> success, back to review -> in_progress, re-approve elsewhere, withdraw -> failure", async () => {
   const S3 = "d".repeat(40), S4 = "e".repeat(40);
   const id = await ghTask(12); PRS[12] = { head: S3, merged: false };
-  const r = ok(await call("rev", "task_update", { id, status: "approved", head_sha: S3 }, B2));
+  const r = await approveReady(id, S3);
   assert.deepEqual(r.github_check, [{ sha: S3, check: "agent-board/approved", desired: "success", delivery: "queued" }]);
   await waitCheck(S3, "success");
   assert.equal(CHECKS[S3][0].name, "agent-board/approved");
   ok(await call("claude", "task_update", { id, status: "in_review" }, B2));
   await waitCheck(S3, "in_progress");
   PRS[12] = { head: S4, merged: false };
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S4 }, B2));
+  await approveReady(id, S4);
   await waitCheck(S4, "success");
   await waitCheck(S3, "failure");                        // nobody vouches for the old SHA any more (never neutral)
   ok(await call("claude", "task_update", { id, status: "in_progress" }, B2));
@@ -415,7 +553,7 @@ test("outbox: check-run delivery retries after 5xx and ends in the correct state
   const S5 = "1".repeat(40);
   const id = await ghTask(13); PRS[13] = { head: S5, merged: false };
   GH.failChecks = 3;
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S5 }, B2));
+  await approveReady(id, S5);
   await sleep(500);
   assert.equal(CHECKS[S5], undefined, "first attempts failed");
   await waitCheck(S5, "success", 20000);
@@ -428,16 +566,17 @@ test("bypass: approve then withdraw, with the approve delivery slow or failing, 
   // (a) approve's check run is in flight (slow GitHub) when the owner withdraws
   let id = await ghTask(14); PRS[14] = { head: S6, merged: false };
   GH.checkDelay = 1500;
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S6 }, B2));
+  await approveReady(id, S6);
   await sleep(300);
   ok(await call("claude", "task_update", { id, status: "in_progress", note: "bug" }, B2));
   GH.checkDelay = 0;
   await waitCheck(S6, "failure", 20000);
   // (b) approve's delivery fails, withdraw happens before the retry: only the latest state is sent
   id = await ghTask(15); PRS[15] = { head: S7, merged: false };
-  GH.failChecks = 1;
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S7 }, B2));
+  GH.failChecks = 100;
+  await approveReady(id, S7);
   ok(await call("claude", "task_update", { id, status: "blocked" }, B2));
+  GH.failChecks = 0;
   await waitCheck(S7, "failure", 20000);
   assert.ok(!CHECKS[S7].some((c) => c.conclusion === "success"), "a stale success was never sent: " + JSON.stringify(CHECKS[S7]));
 });
@@ -446,14 +585,14 @@ test("same SHA on several tasks: success needs a current approval and no task th
   const X = "4".repeat(40);
   PRS[16] = { head: X, merged: false }; PRS[17] = { head: X, merged: false };
   const a = await ghTask(16), b = await ghTask(17);
-  ok(await call("rev", "task_update", { id: a, status: "approved", head_sha: X }, B2));
-  ok(await call("rev", "task_update", { id: b, status: "approved", head_sha: X }, B2));
+  await approveReady(a, X);
+  await approveReady(b, X);
   await waitCheck(X, "success");
   ok(await call("claude", "task_update", { id: b, status: "in_progress", note: "this SHA breaks task b" }, B2));
   await waitCheck(X, "failure");                         // a still approves it, but b took it back
   ok(await call("claude", "task_update", { id: b, status: "in_review" }, B2));
   await waitCheck(X, "in_progress");                     // b is being re-reviewed
-  ok(await call("rev", "task_update", { id: b, status: "approved", head_sha: X }, B2));
+  await approveReady(b, X);
   await waitCheck(X, "success");
   ok(await call("claude", "task_update", { id: b, status: "cancelled" }, B2));
   await waitCheck(X, "success");                         // a cancelled task stops blocking; a still approves
@@ -466,7 +605,7 @@ const allConclusions = () => Object.values(CHECKS).flat().map((c) => c.conclusio
 test("never neutral: approve then cancel gives failure", async () => {
   const S8 = "5".repeat(40);
   const id = await ghTask(18); PRS[18] = { head: S8, merged: false };
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S8 }, B2));
+  await approveReady(id, S8);
   await waitCheck(S8, "success");
   ok(await call("claude", "task_update", { id, status: "cancelled" }, B2));
   await waitCheck(S8, "failure");
@@ -476,13 +615,13 @@ test("never neutral: approve then cancel gives failure", async () => {
 test("never neutral: S3 approved, withdrawn, then S4 approved leaves S3 at failure", async () => {
   const S3 = "6".repeat(40), S4 = "7".repeat(40);
   const id = await ghTask(19); PRS[19] = { head: S3, merged: false };
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S3 }, B2));
+  await approveReady(id, S3);
   await waitCheck(S3, "success");
   ok(await call("claude", "task_update", { id, status: "in_progress" }, B2));
   await waitCheck(S3, "failure");
   ok(await call("claude", "task_update", { id, status: "in_review" }, B2));
   PRS[19] = { head: S4, merged: false };
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S4 }, B2));
+  await approveReady(id, S4);
   await waitCheck(S4, "success");
   await waitCheck(S3, "failure");
   assert.equal(CHECKS[S3].at(-1).title, "No current approval");
@@ -492,8 +631,9 @@ test("never neutral: S3 approved, withdrawn, then S4 approved leaves S3 at failu
 test("outbox failures are visible: wrong App key shows last_error in task_get and the web UI", async () => {
   const S9 = "8".repeat(40);
   const id = await ghTask(20); PRS[20] = { head: S9, merged: false };
+  await approveReady(id, S9);
   GH.wrongKey = true; GH.revoke = true;      // GitHub no longer accepts the board's App key; the cached token is revoked
-  ok(await call("rev", "task_update", { id, status: "approved", head_sha: S9 }, B2));
+  ok(await release(id, S9));
   let g;
   for (let i = 0; i < 60; i++) { g = await call("rev", "task_get", { id }, B2); if (/token request failed \(401\)/.test(g.github_check?.[0]?.last_error || "")) break; await sleep(250); }
   const k = g.github_check[0];
@@ -508,8 +648,11 @@ test("outbox failures are visible: wrong App key shows last_error in task_get an
   assert.ok((await (await fetch(B2 + "/board/app.js", { headers: { cookie } })).text()).includes("re-check before merging"));
   // key fixed: the retry delivers and the error clears
   GH.wrongKey = false; GH.revoke = false;
-  await waitCheck(S9, "success", 30000);
-  g = await call("rev", "task_get", { id }, B2);
+  for (let i = 0; i < 120; i++) {
+    g = await call("rev", "task_get", { id }, B2);
+    if (!g.github_check[0].pending) break;
+    await sleep(250);
+  }
   assert.equal(g.github_check[0].pending, false); assert.equal(g.github_check[0].last_error, null); assert.equal(g.github_check[0].delivered, "success");
 });
 
@@ -523,4 +666,68 @@ test("unit: source keys are /32 for IPv4 and /64 for IPv6; password minimum is 1
   assert.equal(MIN_PASSWORD, 16);
   assert.equal(passwordOk({ OWNER_PASSWORD: "x".repeat(15) }), false);
   assert.equal(passwordOk({ OWNER_PASSWORD: "x".repeat(16) }), true);
+});
+
+test("CI configuration must name an independent check and an expected App", async () => {
+  const { verifyCI } = await import("../src/github.js");
+  await assert.rejects(verifyCI({}, SHA1), /require GitHub binding/);
+  const env = { GITHUB_REPO: "test-org/test-repo", GITHUB_TOKEN: "synthetic-only" };
+  for (const REQUIRED_CI_CHECKS of [undefined, "bad-json", "[]", "{}", '[{"name":"CI"}]', '[{"name":"agent-board/approved","app_id":99}]', '[{"name":"CI","app_id":0}]'])
+    await assert.rejects(verifyCI({ ...env, REQUIRED_CI_CHECKS }, SHA1), /REQUIRED_CI_CHECKS/);
+});
+
+test("legacy migration requeues stale green checks; audit/outbox failures roll back the entire change", async () => {
+  const { DatabaseSync } = await import("node:sqlite");
+  const { initTasks, taskCall } = await import("../src/tasks.js");
+  const { initChecks, desiredState } = await import("../src/checks.js");
+  const { initBoard } = await import("../src/board.js");
+  const { loadConfig } = await import("../src/config.js");
+  const db = new DatabaseSync(":memory:");
+  let fail = "", alarms = 0;
+  const sql = { exec(query, ...args) {
+    if (fail && query.startsWith(fail)) throw new Error("injected storage failure");
+    const stmt = db.prepare(query), rows = stmt.columns().length ? stmt.all(...args) : (stmt.run(...args), []);
+    return { toArray: () => rows, one: () => { assert.equal(rows.length, 1); return rows[0]; } };
+  } };
+  try {
+    db.exec("CREATE TABLE tasks(id TEXT PRIMARY KEY, seq INTEGER UNIQUE, title TEXT, description TEXT, owner TEXT, reviewer TEXT, status TEXT, next_owner TEXT, links TEXT, touches_mainline INTEGER, data_level TEXT, created_by TEXT, created_at TEXT, updated_at TEXT, approved_sha TEXT, check_sha TEXT)");
+    sql.exec("INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", "T-001", 1, "legacy", "", "owner", "rev", "approved", "merger", "{}", 0, "test", "owner", "2026-01-01", "2026-01-01", SHA1, SHA1);
+    initBoard(sql); initTasks(sql); initChecks(sql);
+    sql.exec("INSERT INTO check_outbox(sha,gen,sent_gen,last_state) VALUES(?,1,1,'success')", SHA1);
+    initTasks(sql); initChecks(sql);
+    assert.equal(sql.exec("SELECT title FROM tasks").one().title, "legacy");
+    assert.equal(sql.exec("SELECT revision FROM tasks").one().revision, 0);
+    assert.deepEqual({ ...sql.exec("SELECT gen,sent_gen FROM check_outbox").one() }, { gen: 2, sent_gen: 1 });
+    assert.equal(desiredState(sql, SHA1).status, "in_progress");
+    assert.equal(sql.exec("SELECT COUNT(*) n FROM task_audit").one().n, 0, "no invented legacy audit");
+
+    sql.exec("UPDATE tasks SET status='in_review',approved_sha=NULL");
+    const cfg = loadConfig({ IDENTITIES: "rev,owner,qa,merger", APPROVERS: "rev", MERGERS: "merger", DEFAULT_REVIEWER: "rev", QA_REVIEWERS: "qa", RELEASE_APPROVERS: "merger" });
+    const self = { sql, env: {}, waiters: new Set(), ctx: { waitUntil: () => {}, storage: {
+      setAlarm: async () => { alarms++; },
+      transactionSync(fn) {
+        db.exec("BEGIN");
+        try { const r = fn(); db.exec("COMMIT"); return r; } catch (e) { db.exec("ROLLBACK"); throw e; }
+      },
+    } } };
+    fail = "INSERT INTO task_audit";
+    await assert.rejects(taskCall(self, cfg, "rev", "task_update", { id: "T-001", status: "approved", head_sha: SHA1 }), /injected storage failure/);
+    assert.equal(sql.exec("SELECT status FROM tasks").one().status, "in_review");
+    assert.equal(sql.exec("SELECT COUNT(*) n FROM task_hist").one().n, 0);
+    fail = "";
+    ok(await taskCall(self, cfg, "rev", "task_update", { id: "T-001", status: "approved", head_sha: SHA1 }));
+    const before = sql.exec("SELECT * FROM tasks").one(), history = sql.exec("SELECT COUNT(*) n FROM task_hist").one().n;
+    self.env = { GITHUB_REPO: "synthetic/repo", GITHUB_APP_ID: "1", GITHUB_APP_INSTALLATION_ID: "1", GITHUB_APP_PRIVATE_KEY: "synthetic-unused-placeholder" };
+    fail = "INSERT INTO check_outbox";
+    await assert.rejects(taskCall(self, cfg, "qa", "task_attest", { id: "T-001", kind: "qa", head_sha: SHA1, passed: true }), /injected storage failure/);
+    assert.deepEqual(sql.exec("SELECT * FROM tasks").one(), before);
+    assert.equal(sql.exec("SELECT COUNT(*) n FROM task_hist").one().n, history);
+    assert.equal(sql.exec("SELECT COUNT(*) n FROM task_audit").one().n, 1);
+    assert.equal(alarms, 0);
+    fail = "";
+    ok(await taskCall(self, cfg, "qa", "task_attest", { id: "T-001", kind: "qa", head_sha: SHA1, passed: true }));
+    assert.equal(sql.exec("SELECT qa_sha FROM tasks").one().qa_sha, SHA1);
+    assert.equal(sql.exec("SELECT COUNT(*) n FROM task_audit").one().n, 2);
+    assert.equal(alarms, 1);
+  } finally { db.close(); }
 });

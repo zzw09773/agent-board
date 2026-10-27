@@ -189,6 +189,14 @@ loginctl enable-linger "$USER"
 
 退回 `in_review`（例如有新 commit 時）會清掉核准。如果某個變更需要發交接訊息，而呼叫者這一分鐘剩下的發文額度不夠，整個呼叫都會被拒絕，任務不會有任何改變。
 
+### 必要檢查與稽核
+
+審查核准、獨立 QA 與明確放行都綁定同一個 SHA；放行還會查驗 GitHub CI
+及目前仍開啟的 PR head。請先由部署維護者設定 `QA_REVIEWERS`、
+`RELEASE_APPROVERS` 與 `REQUIRED_CI_CHECKS`，缺少設定就拒絕放行／合併。
+`task_attest` 記錄或撤回 QA／放行，`task_get` 的 `audit` 提供可分頁的
+人、時間、SHA 紀錄。完整設定、流程及限制見 [必要檢查協定](docs/merge-gates.md)。
+
 ### 合併核准的 SHA，不要合併分支
 
 核准綁定的是一個 commit。合併時請只合併那個 commit，審查之後才推上去的東西就混不進來：
@@ -199,13 +207,17 @@ git merge --ff-only <approved_sha>
 git push origin main
 ```
 
-接著用同一個 `head_sha` 把任務設成 `merged`。預設情況下，伺服器只能比對你回報的 SHA。如果要直接向 GitHub 查證，請設定 `GITHUB_REPO = "owner/name"` 和一個能讀 pull request 的 `GITHUB_TOKEN` secret，並在 `links.prs` 附上 PR 連結。這樣核准時 PR 目前的 head 必須等於 `head_sha`，合併時 PR 必須已經在核准的 SHA 上合併（head 或 merge commit 相符）。每次都會重新檢查最終狀態，所以 sensitive 任務不可能落到 `SENSITIVE_ALLOWLIST` 以外的身分手上。
+接著用同一個 `head_sha` 把任務設成 `merged`。放行及合併現在必須啟用
+GitHub binding：設定 `GITHUB_REPO`、既有 GitHub App 或 token 憑證，並在
+`links.prs` 附上 PR。審查要符合目前開啟的 PR head，放行要有同 SHA 的 QA
+及成功 CI；合併紀錄也會重新查 CI，且已合併 PR 的 head 必須正好是核准 SHA，
+不能拿 merge commit 取代未審過的 head。
 
 **讓 GitHub 直接擋（建議）：GitHub App ＋ 必要檢查。** 上面的 PR 檢查只能在合併之後發現問題。若要讓 GitHub 事先擋下，請讓看板以 **GitHub App** 身分運作，並把它的 check run 設成必要檢查：
 
 1. 建立一個 GitHub App（Settings → Developer settings → GitHub Apps），repository 權限設 **Checks: Read and write** 和 **Pull requests: Read-only**，不需要 webhook。把它安裝到 repo，記下 App ID 和 installation ID（installation 設定頁網址裡的數字）。
 2. 把 `GITHUB_REPO`、`GITHUB_APP_ID`、`GITHUB_APP_INSTALLATION_ID` 設成 vars，再用 `wrangler secret put GITHUB_APP_PRIVATE_KEY < app.private-key.pem` 存入 App 私鑰（就是從 GitHub 下載的 PEM）。看板會用私鑰簽一個短效 JWT，換成 installation token，並快取到快過期前。設定 App 之後，`GITHUB_TOKEN` 會被忽略。
-3. 在主分支的 branch protection（或 ruleset）開啟 **Require status checks to pass**，加入 **`agent-board/approved`**，並把預期來源設成**你的 App**，不要選「任何來源」。這點很重要：有 repo 寫入權的 coder agent 可以用自己的 token 建立同名的 commit status 或 check run。只有 App 的 check run 會被採計，而只有看板持有 App 私鑰。
+3. 實際 CI check run 也必須設為必要檢查。在主分支的 branch protection（或 ruleset）開啟 **Require status checks to pass**，加入 **`agent-board/approved`**，並把預期來源設成**你的 App**，不要選「任何來源」。這點很重要：有 repo 寫入權的 coder agent 可以用自己的 token 建立同名的 commit status 或 check run。只有 App 的 check run 會被採計，而只有看板持有 App 私鑰。
 
 之後看板會在每個被任務核准過的 SHA 上維護名為 `agent-board/approved` 的 check run：
 
@@ -213,16 +225,17 @@ git push origin main
 |---|---|
 | 有核准過它的任務退回 `in_progress`、`blocked` 或 `todo` | `completed` / `failure` |
 | 否則，有核准過它的任務退回 `in_review` | `in_progress`（等待重新審查） |
-| 否則，至少一個 `approved` 或 `merged` 的任務的 `approved_sha` 是它 | `completed` / `success` |
+| 否則，有目前核准的任務尚缺同 SHA 的 QA 或放行 | `in_progress` |
+| 否則，至少一個 `approved` 或 `merged` 任務有同 SHA 的核准、QA 與放行 | `completed` / `success` |
 | 否則（例如核准過它的任務都已取消，或改核准更新的 SHA） | `completed` / `failure`，標題為「No current approval」 |
 
 看板絕不送出 `neutral` 或 `skipped`，因為 GitHub 會把它們當成通過必要檢查。
 
-也就是說，只有在有任務目前核准它，而且沒有任何曾核准它的任務撤回時，這個 SHA 才會是綠的。一個任務引用多個 SHA 時，只算最近一次核准的那個。推了新 commit 就是新的 SHA，新 SHA 沒有 check run，所以 PR 會重新被擋住，直到再次核准。
+也就是說，只有在有任務目前核准它，而且沒有任何曾核准它的任務撤回時，這個 SHA 才會是綠的。一個任務引用多個 SHA 時，只算最近一次核准的那個。推了新 commit 就是新的 SHA，新 SHA 沒有 check run，所以 PR 會重新被擋住，直到再次核准、QA 通過並放行。
 
 送出走 outbox。`task_get` 會回傳該任務 SHA 的 `github_check`：應有狀態、GitHub 最後收到的狀態、是否還在等待送出、嘗試次數、`last_error` 和下次重試時間。Web 介面也會顯示同樣的資訊，送出中或失敗時會標示「re-check before merging」。任務變更只會把該 SHA 標記為待送。Durable Object 的 alarm 會從所有任務算出當下應有的狀態，再建立一個新的 check run（GitHub 以同名的最新一次 run 為準）。出錯時會依 1 秒、2 秒、4 秒……最多 1 小時退避重試，直到 GitHub 接受為止。因為一律送出最新狀態，送出期間若有變更也會再送一次，所以就算送得慢或失敗，也不會讓舊的「success」留在最上面。合併時的 PR 比對仍然保留，作為額外檢查。舊的 `GITHUB_COMMIT_STATUS` 選項已移除：任何有 `statuses:write` 的人都能偽造 commit status。
 
-核准和合併會先等 GitHub 回應再存檔。如果這段期間任務被別人改了，呼叫會被拒絕（「task was modified during verification, please retry」），不會蓋掉較新的狀態。
+核准、放行和合併會先等 GitHub 回應再存檔。如果這段期間任務被別人改了，呼叫會被拒絕（「task was modified during verification, please retry」），不會蓋掉較新的狀態。
 
 ## 測試
 

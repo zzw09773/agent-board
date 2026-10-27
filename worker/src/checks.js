@@ -7,36 +7,41 @@ import { appEnabled, createCheckRun, CHECK_NAME } from "./github.js";
 
 export function initChecks(sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS check_outbox(sha TEXT PRIMARY KEY, gen INTEGER NOT NULL DEFAULT 1, sent_gen INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0, last_state TEXT, last_error TEXT)");
+  for (const { sha } of sql.exec("SELECT sha FROM check_outbox WHERE last_state='success' AND gen=sent_gen").toArray()) {
+    if (label(desiredState(sql, sha)) !== "success")
+      sql.exec("UPDATE check_outbox SET gen=gen+1, attempts=0, next_at=0 WHERE sha=?", sha);
+  }
 }
 
 // Rule for one SHA, over every task that references it (approved_sha = SHA, or check_sha = SHA: it approved
 // this SHA before and has not been approved on another SHA since):
 //  - a "withdrawn" task: references the SHA via check_sha, no longer approves it, and is not finished
 //    (cancelled/merged). Any such task in in_review -> in_progress (re-review pending); in any other state -> failure.
-//  - otherwise success iff at least one task in approved/merged has approved_sha = SHA
+//  - otherwise pending if any approving task lacks QA/release on this SHA
+//  - otherwise success iff at least one task in approved/merged has approval, QA and release on this SHA
 //  - otherwise failure, titled "No current approval" (nobody vouches for it any more, e.g. all referencing tasks
 //    were cancelled or approved a newer SHA). Never neutral/skipped: GitHub counts those as PASSING required checks.
 // So success needs a current approval AND no task that once approved this SHA has since taken it back.
 export function desiredState(sql, sha) {
-  const rows = sql.exec("SELECT id, status, approved_sha, check_sha FROM tasks WHERE approved_sha=? OR check_sha=? ORDER BY seq", sha, sha).toArray();
+  const rows = sql.exec("SELECT id, status, approved_sha, check_sha, qa_sha, release_sha FROM tasks WHERE approved_sha=? OR check_sha=? ORDER BY seq", sha, sha).toArray();
   const approving = rows.filter((r) => r.approved_sha === sha && ["approved", "merged"].includes(r.status));
   const withdrawn = rows.filter((r) => r.check_sha === sha && r.approved_sha !== sha && !["cancelled", "merged"].includes(r.status));
   const ids = (a) => a.map((r) => `${r.id} (${r.status})`).join(", ");
   if (withdrawn.some((r) => r.status !== "in_review")) return { status: "completed", conclusion: "failure", title: "Approval withdrawn", summary: `Withdrawn by: ${ids(withdrawn)}` };
   if (withdrawn.length) return { status: "in_progress", title: "Back in review", summary: `Re-review pending: ${ids(withdrawn)}` };
-  if (approving.length) return { status: "completed", conclusion: "success", title: "Approved on agent-board", summary: `Approved by task(s): ${ids(approving)}` };
+  if (approving.some((r) => r.qa_sha !== sha || r.release_sha !== sha)) return { status: "in_progress", title: "Waiting for QA and release", summary: `Not all gates passed: ${ids(approving)}` };
+  if (approving.length) return { status: "completed", conclusion: "success", title: "Released on agent-board", summary: `Review, QA and release on this SHA: ${ids(approving)}` };
   return { status: "completed", conclusion: "failure", title: "No current approval", summary: "No task currently approves this commit." };
 }
 const label = (s) => s.conclusion || s.status;
 
-export async function markDirty(self, shas) {
+export function queueChecks(self, shas) {
   if (!appEnabled(self.env)) return null;
   const list = [...new Set(shas.filter(Boolean))];
   if (!list.length) return null;
   const now = Date.now();
   for (const sha of list)
     self.sql.exec("INSERT INTO check_outbox(sha, gen, sent_gen, attempts, next_at) VALUES(?,1,0,0,?) ON CONFLICT(sha) DO UPDATE SET gen=gen+1, attempts=0, next_at=?", sha, now, now);
-  await self.ctx.storage.setAlarm(now);
   return list.map((sha) => ({ sha, check: CHECK_NAME, desired: label(desiredState(self.sql, sha)), delivery: "queued" }));
 }
 

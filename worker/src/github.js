@@ -3,8 +3,8 @@
 //    PKCS#1 "BEGIN RSA PRIVATE KEY" as downloaded from GitHub, or PKCS#8; literal "\n" escapes are accepted).
 //    App permissions: Pull requests: read, Checks: write. Enables the PR checks below AND the
 //    "agent-board/approved" check run, which branch protection can require *from this App only*.
-//  - or a plain GITHUB_TOKEN (read-only PR checks; no check runs: a token can't prove it is the board).
-// PR checks: approve = PR head equals head_sha; merge = PR merged with head or merge commit equal to approved_sha.
+//  - or a plain GITHUB_TOKEN (read PRs/CI; no board check runs: a token can't prove it is the board).
+// Review/release bind the current open PR head; merge requires that exact reviewed head plus fresh CI.
 // GITHUB_API_BASE can point at a mock server for tests (default https://api.github.com).
 // GITHUB_COMMIT_STATUS (commit statuses) was removed: any token with statuses:write can forge a status.
 export const CHECK_NAME = "agent-board/approved";
@@ -58,7 +58,28 @@ export async function fetchPr(env, n) {
   const r = await fetch(`${apiBase(env)}/repos/${env.GITHUB_REPO}/pulls/${n}`, { headers: H(await authHeader(env)), signal: AbortSignal.timeout(10000) });
   if (!r.ok) throw new Error(`GitHub API ${r.status} for PR #${n}`);
   const j = await r.json();
-  return { head: String(j.head?.sha || "").toLowerCase(), merged: !!j.merged, mergeCommit: String(j.merge_commit_sha || "").toLowerCase() };
+  return { head: String(j.head?.sha || "").toLowerCase(), merged: !!j.merged, state: j.state, mergeCommit: String(j.merge_commit_sha || "").toLowerCase() };
+}
+
+export async function verifyCI(env, sha) {
+  if (!githubEnabled(env)) throw new Error("merge gates require GitHub binding");
+  let required;
+  try { required = JSON.parse(env.REQUIRED_CI_CHECKS || "null"); } catch { /* rejected below */ }
+  if (!Array.isArray(required) || !required.length || required.length > 20 || required.some((c) =>
+    !c || typeof c.name !== "string" || !c.name.trim() || c.name === CHECK_NAME || !Number.isSafeInteger(c.app_id) || c.app_id <= 0))
+    throw new Error("REQUIRED_CI_CHECKS must be a nonempty JSON array of {name, app_id}; the board check cannot count as CI");
+  const headers = H(await authHeader(env)), evidence = [];
+  for (const c of required) {
+    const q = new URLSearchParams({ check_name: c.name, app_id: String(c.app_id), filter: "latest", per_page: "100" });
+    const r = await fetch(`${apiBase(env)}/repos/${env.GITHUB_REPO}/commits/${sha}/check-runs?${q}`, { headers, signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error(`GitHub API ${r.status} checking CI`);
+    const j = await r.json(), runs = j.check_runs;
+    if (!Array.isArray(runs) || !runs.length || j.total_count !== runs.length || runs.some((x) =>
+      x.head_sha !== sha || x.name !== c.name || x.app?.id !== c.app_id || x.status !== "completed" || x.conclusion !== "success"))
+      throw new Error(`CI ${c.name} from App ${c.app_id} is missing, incomplete, or not successful on ${sha}`);
+    evidence.push(...runs.map((x) => ({ name: x.name, app_id: x.app.id, run_id: x.id, sha })));
+  }
+  return evidence;
 }
 
 // Each change creates a new check run; GitHub evaluates the most recent run of a given name on a commit.

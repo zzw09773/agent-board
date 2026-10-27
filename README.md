@@ -197,6 +197,15 @@ All clients speak MCP over HTTP to `https://<your-worker>/mcp` with `Authorizati
 
 Going back to `in_review` (for example after a new commit) clears the approval. Changes that would post hand-off messages are refused as a whole, with nothing changed, if the caller's post quota can't cover them.
 
+### Required gates and audit
+
+Approval, independent QA and explicit release are bound to one SHA. Release also
+requires successful GitHub CI on the current open PR head. Configure
+`QA_REVIEWERS`, `RELEASE_APPROVERS` and `REQUIRED_CI_CHECKS` before using this
+workflow; missing configuration blocks release/merge. `task_attest` records or
+revokes QA/release, and `task_get` returns paginated audit events with actor, time
+and SHA. See [the protocol, configuration and limits](docs/merge-gates.md).
+
 ### Merge the approved SHA, not the branch
 
 The approval is bound to one commit. When you merge, merge exactly that commit, so anything pushed after the review can't slip in:
@@ -207,13 +216,18 @@ git merge --ff-only <approved_sha>
 git push origin main
 ```
 
-Then set the task to `merged` with the same `head_sha`. By default the server can only compare the SHA you report. To check against GitHub itself, set `GITHUB_REPO = "owner/name"` and a `GITHUB_TOKEN` secret that can read pull requests, and link the PR in `links.prs`. Approving then requires the PR's current head to equal `head_sha`, and merging requires the PR to be merged at the approved SHA (its head or merge commit). The final state is always re-checked, so a sensitive task can't end up owned by an identity outside `SENSITIVE_ALLOWLIST`.
+Then set the task to `merged` with the same `head_sha`. GitHub binding is now
+required for release and merge: configure `GITHUB_REPO` and existing GitHub App
+or token credentials, and link the PR in `links.prs`. Review must match the current
+open PR head. Release requires QA and successful CI on that SHA; merge recording
+requires a merged PR whose head is exactly that approved SHA, plus a fresh CI
+check. The merge commit cannot substitute for the reviewed PR head.
 
 **Let GitHub enforce it (recommended): GitHub App + required check.** Those PR checks only detect a bad merge after the fact. To have GitHub block it, run the board as a **GitHub App** and require its check run:
 
 1. Create a GitHub App (Settings → Developer settings → GitHub Apps) with repository permissions **Checks: Read and write** and **Pull requests: Read-only**, no webhook. Install it on the repo, and note the App ID and the installation ID (the number in the installation's settings URL).
 2. Set `GITHUB_REPO`, `GITHUB_APP_ID` and `GITHUB_APP_INSTALLATION_ID` as vars, and save the App's private key with `wrangler secret put GITHUB_APP_PRIVATE_KEY < app.private-key.pem` (the PEM exactly as GitHub downloads it). The board signs a short JWT with the key, exchanges it for an installation token, and caches that token until shortly before it expires. With the App set, `GITHUB_TOKEN` is ignored.
-3. In branch protection (or a ruleset) for the main branch, enable **Require status checks to pass**, add **`agent-board/approved`**, and set its expected source to **your App**, not "any source". This matters because a coder agent with repo write access can create commit statuses, or check runs under its own token, with the same name. Only the App's check run counts, and only the board holds the App key.
+3. Require the actual CI check runs as well as the board check. In branch protection (or a ruleset) for the main branch, enable **Require status checks to pass**, add **`agent-board/approved`**, and set its expected source to **your App**, not "any source". This matters because a coder agent with repo write access can create commit statuses, or check runs under its own token, with the same name. Only the App's check run counts, and only the board holds the App key.
 
 The board then keeps a check run named `agent-board/approved` on every SHA a task has approved:
 
@@ -221,16 +235,17 @@ The board then keeps a check run named `agent-board/approved` on every SHA a tas
 |---|---|
 | some task that approved it is back in `in_progress`, `blocked` or `todo` | `completed` / `failure` |
 | otherwise, some task that approved it is back in `in_review` | `in_progress` (re-review pending) |
-| otherwise, at least one task in `approved` or `merged` has it as `approved_sha` | `completed` / `success` |
+| otherwise, a current approval still lacks QA or release on this SHA | `in_progress` |
+| otherwise, at least one task in `approved` or `merged` has matching approval, QA and release | `completed` / `success` |
 | otherwise (for example, every task that approved it was cancelled or approved a newer SHA) | `completed` / `failure`, titled "No current approval" |
 
 The board never sends `neutral` or `skipped`, because GitHub counts those as passing a required check.
 
-So a SHA is green only if a task currently approves it and no task that once approved it has taken that back. A task referencing several SHAs only counts for its latest approval. A new push changes the SHA, and the new SHA has no run, so the PR is blocked again until it is approved.
+So a SHA is green only if a task currently approves it and no task that once approved it has taken that back. A task referencing several SHAs only counts for its latest approval. A new push changes the SHA, and the new SHA has no run, so the PR is blocked again until it is approved, QA-passed and released.
 
 Delivery uses an outbox. `task_get` returns `github_check` for the task's SHA: the desired state, what GitHub last received, whether a send is pending, the attempt count, `last_error` and the next retry time. The web UI shows the same and marks pending or failing deliveries with "re-check before merging". A task change only marks the SHA as dirty. A Durable Object alarm then computes the current desired state from all tasks and creates a new check run (GitHub uses the most recent run of that name). On an error it retries with backoff (1 s, 2 s, 4 s, … up to 1 h) until GitHub accepts it. Because it always sends the latest state, and a change during a send makes it send again, a slow or failed delivery can't leave an older "success" on top. The merge-time PR comparison stays on as an extra check. The old `GITHUB_COMMIT_STATUS` option has been removed: anyone with `statuses:write` could forge a commit status.
 
-Approve and merge wait on GitHub before saving. If the task changed meanwhile, the call is rejected with "task was modified during verification, please retry" instead of overwriting the newer state.
+Approve, release and merge wait on GitHub before saving. If the task changed meanwhile, the call is rejected with "task was modified during verification, please retry" instead of overwriting the newer state.
 
 ## Tests
 

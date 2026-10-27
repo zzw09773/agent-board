@@ -2,8 +2,8 @@
 // so no agent can skip review, self-approve, or hand sensitive work to a cloud model.
 import { canon } from "./config.js";
 import { post, quotaLeft } from "./board.js";
-import { githubEnabled, prNumber, fetchPr } from "./github.js";
-import { markDirty, checkInfo } from "./checks.js";
+import { githubEnabled, prNumber, fetchPr, verifyCI } from "./github.js";
+import { queueChecks, checkInfo } from "./checks.js";
 
 export const STATUSES = ["todo", "in_progress", "in_review", "approved", "merged", "blocked", "cancelled"];
 const LOCKING = ["in_review", "approved"]; // states that hold the mainline lock (review through merge)
@@ -13,14 +13,16 @@ const now = () => new Date().toISOString();
 
 export function initTasks(sql) {
   sql.exec("CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, seq INTEGER UNIQUE, title TEXT, description TEXT, owner TEXT, reviewer TEXT, status TEXT, next_owner TEXT, links TEXT, touches_mainline INTEGER, data_level TEXT, created_by TEXT, created_at TEXT, updated_at TEXT)");
-  for (const c of ["approved_sha TEXT", "check_sha TEXT"]) { try { sql.exec("ALTER TABLE tasks ADD COLUMN " + c); } catch { /* already there */ } }
+  for (const c of ["approved_sha TEXT", "check_sha TEXT", "qa_sha TEXT", "release_sha TEXT", "revision INTEGER NOT NULL DEFAULT 0"]) { try { sql.exec("ALTER TABLE tasks ADD COLUMN " + c); } catch { /* already there */ } }
   sql.exec("CREATE TABLE IF NOT EXISTS task_hist(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, at TEXT, actor TEXT, action TEXT, detail TEXT)");
+  sql.exec("CREATE TABLE IF NOT EXISTS task_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, sha TEXT NOT NULL, detail TEXT NOT NULL)");
+  sql.exec("CREATE INDEX IF NOT EXISTS task_audit_task ON task_audit(task_id,id)");
 }
 
 class RuleError extends Error {}
 const rule = (m) => new RuleError(m);
 
-const row = (r) => r && { id: r.id, seq: r.seq, title: r.title, description: r.description, owner: r.owner, reviewer: r.reviewer, status: r.status, next_owner: r.next_owner, links: JSON.parse(r.links || "{}"), touches_mainline: !!r.touches_mainline, data_level: r.data_level, approved_sha: r.approved_sha || null, check_sha: r.check_sha || null, created_by: r.created_by, created_at: r.created_at, updated_at: r.updated_at };
+const row = (r) => r && { id: r.id, seq: r.seq, title: r.title, description: r.description, owner: r.owner, reviewer: r.reviewer, status: r.status, next_owner: r.next_owner, links: JSON.parse(r.links || "{}"), touches_mainline: !!r.touches_mainline, data_level: r.data_level, approved_sha: r.approved_sha || null, check_sha: r.check_sha || null, qa_sha: r.qa_sha || null, release_sha: r.release_sha || null, revision: r.revision || 0, created_by: r.created_by, created_at: r.created_at, updated_at: r.updated_at };
 const pub = (t) => { if (!t) return t; const { seq, ...o } = t; return o; };
 const get = (self, id) => row(self.sql.exec("SELECT * FROM tasks WHERE id=?", String(id || "").trim().toUpperCase()).toArray()[0]);
 const lockHolder = (self, except) => row(self.sql.exec("SELECT * FROM tasks WHERE touches_mainline=1 AND status IN ('in_review','approved') AND id<>? LIMIT 1", except || "").toArray()[0]) || null;
@@ -61,6 +63,7 @@ function check(self, cfg, t, prev, actor) {
       if (!t._head_sha) throw rule("merging requires head_sha: the commit SHA being merged");
       if (!prev.approved_sha || prev.approved_sha !== t._head_sha)
         throw rule(`head_sha ${t._head_sha} does not match the approved commit ${prev.approved_sha || "(none)"}; send it back to in_review`);
+      if (prev.qa_sha !== prev.approved_sha || prev.release_sha !== prev.approved_sha) throw rule("merging requires QA and release on the approved SHA");
     }
   } else if (!prev && !["todo", "blocked", "cancelled"].includes(t.status)) throw rule("new tasks start as todo");
   if (["in_progress", "in_review", "approved"].includes(t.status) && !t.owner) throw rule(`${t.status} needs an owner; task_claim first`);
@@ -76,8 +79,8 @@ function check(self, cfg, t, prev, actor) {
 }
 
 function save(self, t) {
-  self.sql.exec("INSERT OR REPLACE INTO tasks(id,seq,title,description,owner,reviewer,status,next_owner,links,touches_mainline,data_level,created_by,created_at,updated_at,approved_sha,check_sha) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-    t.id, t.seq, t.title, t.description, t.owner, t.reviewer, t.status, t.next_owner, JSON.stringify(t.links || {}), t.touches_mainline ? 1 : 0, t.data_level, t.created_by, t.created_at, t.updated_at, t.approved_sha || null, t.check_sha || null);
+  self.sql.exec("INSERT OR REPLACE INTO tasks(id,seq,title,description,owner,reviewer,status,next_owner,links,touches_mainline,data_level,created_by,created_at,updated_at,approved_sha,check_sha,qa_sha,release_sha,revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    t.id, t.seq, t.title, t.description, t.owner, t.reviewer, t.status, t.next_owner, JSON.stringify(t.links || {}), t.touches_mainline ? 1 : 0, t.data_level, t.created_by, t.created_at, t.updated_at, t.approved_sha || null, t.check_sha || null, t.qa_sha || null, t.release_sha || null, (t.revision || 0) + 1);
 }
 
 const SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/; // full SHA-1 or SHA-256 commit ids only
@@ -105,9 +108,13 @@ function authorize(cfg, prev, t, actor) {
   if (t.status === "cancelled" && prev.status !== "cancelled" && prev.owner && !(isOwner || isApprover)) throw rule(`only the owner (${prev.owner}) or an approver can cancel ${prev.id}`);
 }
 const log = (self, id, actor, action, detail) => self.sql.exec("INSERT INTO task_hist(task_id,at,actor,action,detail) VALUES(?,?,?,?,?)", id, now(), actor, action, JSON.stringify(detail || {}));
+const audit = (self, id, actor, action, sha, detail = {}) => self.sql.exec("INSERT INTO task_audit(task_id,at,actor,action,sha,detail) VALUES(?,?,?,?,?,?)", id, now(), actor, action, sha, JSON.stringify(detail));
+function unchanged(self, prev) {
+  if (get(self, prev.id)?.revision !== prev.revision) throw rule("task was modified during verification, please retry; nothing was changed");
+}
 function diff(a, b) {
   const d = {};
-  for (const k of ["title", "description", "owner", "reviewer", "status", "next_owner", "touches_mainline", "data_level", "links", "approved_sha"])
+  for (const k of ["title", "description", "owner", "reviewer", "status", "next_owner", "touches_mainline", "data_level", "links", "approved_sha", "qa_sha", "release_sha"])
     if (JSON.stringify(a[k]) !== JSON.stringify(b[k])) d[k] = [a[k] ?? null, b[k] ?? null];
   return d;
 }
@@ -129,18 +136,23 @@ function ensureQuota(self, cfg, actor, targets) {
 // GitHub binding (only when configured): approve = PR head equals head_sha; merge = PR merged at approved_sha.
 async function githubCheck(self, t, prev) {
   const env = self.env;
-  if (!githubEnabled(env)) return;
   const approving = t.status === "approved" && prev && prev.status !== "approved";
   const merging = t.status === "merged" && prev && prev.status !== "merged";
   if (!approving && !merging) return false;
+  if (!githubEnabled(env)) {
+    if (merging) throw rule("merge gates require GitHub binding");
+    return false;
+  }
   const n = prNumber(env, t.links);
   if (!n) throw rule(`GitHub binding is on: add links.prs with a PR URL in ${env.GITHUB_REPO}`);
   let pr;
   try { pr = await fetchPr(env, n); } catch (e) { throw rule(String(e.message || e) + "; nothing was changed"); }
+  if (approving && (pr.merged || pr.state !== "open")) throw rule(`PR #${n} must be open for approval`);
   if (approving && pr.head !== t.approved_sha) throw rule(`PR #${n} head is ${pr.head}, not the head_sha ${t.approved_sha} you approved; review the current head`);
   if (merging) {
     if (!pr.merged) throw rule(`PR #${n} is not merged on GitHub yet; merge the approved SHA first (git merge --ff-only ${prev.approved_sha})`);
-    if (pr.head !== prev.approved_sha && pr.mergeCommit !== prev.approved_sha) throw rule(`PR #${n} was merged at ${pr.head} (merge commit ${pr.mergeCommit}), not the approved ${prev.approved_sha}`);
+    if (pr.head !== prev.approved_sha) throw rule(`PR #${n} was merged at ${pr.head} (merge commit ${pr.mergeCommit}), not the approved ${prev.approved_sha}`);
+    try { t._ci = await verifyCI(env, prev.approved_sha); } catch (e) { throw rule(e.message); }
   }
   return true;
 }
@@ -160,15 +172,18 @@ export function TASK_TOOLS(cfg) {
   const id = { type: "string", enum: cfg.identities };
   const links = { type: "object", description: "links to add: {board:[message ids], prs:[urls], branch:\"name\"}", properties: { board: { type: "array", items: { type: "integer" } }, prs: { type: "array", items: { type: "string" } }, branch: { type: "string" } }, additionalProperties: false };
   return [
+    { name: "task_attest", title: "QA or release attestation", annotations: rw,
+      description: "Record independent QA or explicit release on an approved head_sha. QA_REVIEWERS may attest QA (never the owner/reviewer); RELEASE_APPROVERS may release after QA and current GitHub CI pass. passed=false revokes the gate. Every accepted attestation is audited with actor, time and SHA.",
+      inputSchema: S({ id: { type: "string" }, kind: { type: "string", enum: ["qa", "release"] }, head_sha: { type: "string" }, passed: { type: "boolean" }, note: { type: "string" } }, ["id", "kind", "head_sha", "passed"]) },
     { name: "task_new", title: "New task", annotations: rw, description: "Create a task (starts as todo). Setting next_owner wakes them via the board.",
       inputSchema: S({ title: { type: "string" }, description: { type: "string" }, owner: id, reviewer: id, next_owner: id, touches_mainline: { type: "boolean", default: false }, data_level: { type: "string", enum: LEVELS, default: "test" }, links, note: { type: "string" } }, ["title"]) },
     { name: "task_claim", title: "Claim task", annotations: rw, description: "Become owner and move todo/blocked -> in_progress. Several mainline tasks may be in_progress at once (each in its own worktree); the mainline lock is taken only when requesting review.",
       inputSchema: S({ id: { type: "string" }, note: { type: "string" } }, ["id"]) },
-    { name: "task_update", title: "Update task", annotations: rw, description: `Update status (${STATUSES.join("/")}), owner, reviewer, next_owner, links, note. Only the owner, reviewer or an approver may update (a merger may only merge). Rules: approved only from in_review by the reviewer, with head_sha${cfg.approvers.length ? " (one of " + cfg.approvers.join(", ") + ")" : ""}; merged only from approved with the same head_sha; only an approver can lower data_level, clear touches_mainline or change the reviewer; only owner/approver can reassign or cancel; reviewer != owner; only one mainline task in_review/approved at a time (several may be in_progress; sync to latest main before requesting review); sensitive data only for allowlisted owners.`,
+    { name: "task_update", title: "Update task", annotations: rw, description: `Update status (${STATUSES.join("/")}), owner, reviewer, next_owner, links, note. Only the owner, reviewer or an approver may update (a merger may only merge). Rules: approved only from in_review by the reviewer, with head_sha${cfg.approvers.length ? " (one of " + cfg.approvers.join(", ") + ")" : ""}; merged only from approved with the same head_sha, QA, explicit release and fresh GitHub CI; use task_attest for QA/release; only an approver can lower data_level, clear touches_mainline or change the reviewer; only owner/approver can reassign or cancel; reviewer != owner; only one mainline task in_review/approved at a time (several may be in_progress; sync to latest main before requesting review); sensitive data only for allowlisted owners.`,
       inputSchema: S({ id: { type: "string" }, status: { type: "string", enum: STATUSES }, owner: id, reviewer: id, next_owner: id, title: { type: "string" }, description: { type: "string" }, touches_mainline: { type: "boolean" }, data_level: { type: "string", enum: LEVELS }, head_sha: { type: "string", description: "commit SHA: required when approving (the reviewed commit) and when merging (must match)" }, links, note: { type: "string" } }, ["id"]) },
     { name: "task_list", title: "List tasks", annotations: ro, description: "List tasks (open ones by default). Filters: status, owner, next_owner, mine, include_closed.",
       inputSchema: S({ status: { type: "string", enum: STATUSES }, owner: { type: "string" }, next_owner: { type: "string" }, mine: { type: "boolean" }, include_closed: { type: "boolean", default: false }, limit: { type: "integer", default: 50, minimum: 1, maximum: 200 } }) },
-    { name: "task_get", title: "Get task", annotations: ro, description: "Full task plus change history.", inputSchema: S({ id: { type: "string" } }, ["id"]) },
+    { name: "task_get", title: "Get task", annotations: ro, description: "Full task, history and SHA audit. Page older audit events with before_audit_id.", inputSchema: S({ id: { type: "string" }, before_audit_id: { type: "integer", minimum: 1 } }, ["id"]) },
   ];
 }
 
@@ -190,7 +205,44 @@ export async function taskCall(self, cfg, actor, name, a) {
       if (!t) throw rule("no such task " + a.id);
       const history = self.sql.exec("SELECT at,actor,action,detail FROM task_hist WHERE task_id=? ORDER BY id DESC LIMIT 50", t.id).toArray().map((h) => ({ ...h, detail: JSON.parse(h.detail || "{}") }));
       const checks = [...new Set([t.approved_sha, t.check_sha].filter(Boolean))].map((s) => checkInfo(self.sql, s)).filter(Boolean);
-      return { task: pub(t), history, ...(checks.length ? { github_check: checks } : {}) };
+      if (a.before_audit_id != null && (!Number.isSafeInteger(a.before_audit_id) || a.before_audit_id < 1)) throw rule("before_audit_id must be a positive integer");
+      const events = self.sql.exec("SELECT id,at,actor,action,sha,detail FROM task_audit WHERE task_id=? AND id<? ORDER BY id DESC LIMIT 51", t.id, a.before_audit_id || Number.MAX_SAFE_INTEGER).toArray();
+      const audit = events.slice(0, 50).map((e) => ({ ...e, detail: JSON.parse(e.detail) }));
+      return { task: pub(t), history, audit, next_audit_before: events.length > 50 ? audit.at(-1).id : null, ...(checks.length ? { github_check: checks } : {}) };
+    }
+    if (name === "task_attest") {
+      const prev = get(self, a.id), sha = normSha(a.head_sha);
+      if (!prev) throw rule("no such task " + a.id);
+      if (!["qa", "release"].includes(a.kind) || typeof a.passed !== "boolean") throw rule("kind must be qa/release and passed must be boolean");
+      if (!sha || !SHA.test(sha) || sha !== prev.approved_sha || prev.status !== "approved") throw rule("attestation requires the approved head_sha and approved status");
+      const allowed = a.kind === "qa" ? cfg.qaReviewers : cfg.releaseApprovers;
+      if (!allowed.includes(actor)) throw rule(`only configured ${a.kind} identities may attest this gate`);
+      if (actor === prev.owner || (a.kind === "qa" && actor === prev.reviewer)) throw rule("gate attestation requires an independent identity");
+      const t = { ...prev }, field = a.kind === "qa" ? "qa_sha" : "release_sha";
+      let ci = [];
+      if (a.passed && a.kind === "release") {
+        if (prev.qa_sha !== sha) throw rule("release requires QA on the approved SHA");
+        const n = prNumber(self.env, prev.links);
+        if (!githubEnabled(self.env) || !n) throw rule("release requires GitHub binding and a linked PR");
+        try {
+          ci = await verifyCI(self.env, sha);
+          const pr = await fetchPr(self.env, n);
+          if (pr.head !== sha || pr.merged || pr.state !== "open") throw new Error("release requires the approved SHA at the current open PR head");
+        } catch (e) { throw rule(e.message); }
+      }
+      t[field] = a.passed ? sha : null;
+      if (a.kind === "qa") t.release_sha = null;
+      let github_check;
+      self.ctx.storage.transactionSync(() => {
+        unchanged(self, prev);
+        t.updated_at = now();
+        save(self, t);
+        audit(self, t.id, actor, a.kind + (a.passed ? "_passed" : "_revoked"), sha, { note: String(a.note || "").slice(0, 2000), ci });
+        log(self, t.id, actor, "attest", diff(prev, t));
+        github_check = queueChecks(self, [sha]);
+      });
+      if (github_check) await self.ctx.storage.setAlarm(Date.now());
+      return { ok: true, task: pub(get(self, t.id)), ...(github_check ? { github_check } : {}) };
     }
     if (name === "task_new") {
       if (typeof a.title !== "string" || !a.title.trim()) throw rule("title is required");
@@ -203,8 +255,10 @@ export async function taskCall(self, cfg, actor, name, a) {
         links: mergeLinks({}, a.links), touches_mainline: !!a.touches_mainline, data_level: a.data_level || "test", created_by: actor, created_at: n, updated_at: n };
       check(self, cfg, t, null, actor);
       ensureQuota(self, cfg, actor, notifyTargets(t, null, actor, "new task for you"));
-      save(self, t);
-      log(self, t.id, actor, "create", { ...diff({}, t), note: a.note || undefined });
+      self.ctx.storage.transactionSync(() => {
+        save(self, t);
+        log(self, t.id, actor, "create", { ...diff({}, t), note: a.note || undefined });
+      });
       return { ok: true, task: pub(t), woke: await notify(self, cfg, t, null, actor, "new task for you") };
     }
     if (name === "task_claim" || name === "task_update") {
@@ -229,6 +283,12 @@ export async function taskCall(self, cfg, actor, name, a) {
           if (h && !(prev.status !== t.status && (t.status === "approved" || t.status === "merged"))) throw rule(`head_sha is only accepted when an approver sets approved, or when merging (this call is ${prev.status} -> ${t.status}, so it would not be stored); nothing was changed, drop head_sha and resend`); }
         if (t.status === "approved" && prev.status !== "approved") { t.approved_sha = t._head_sha || null; t.check_sha = t.approved_sha; }
         if (["in_progress", "in_review", "todo", "blocked"].includes(t.status)) t.approved_sha = null;
+        const scopeChanged = ["owner", "reviewer", "links", "data_level", "touches_mainline"].some((k) => JSON.stringify(t[k]) !== JSON.stringify(prev[k]));
+        if ((t.status !== prev.status && t.status !== "merged") || scopeChanged) {
+          t.qa_sha = null; t.release_sha = null;
+          if (prev.status === "approved" && t.status === "approved") throw rule("return to in_review before changing approval scope");
+        }
+        if (t.status === "merged" && scopeChanged) throw rule("merging cannot change approval scope");
         if (a.status === "approved" && a.next_owner === undefined) t.next_owner = cfg.mergers[0] || t.owner;
         if (DONE.includes(t.status) && a.next_owner === undefined) t.next_owner = null;
       }
@@ -237,20 +297,24 @@ export async function taskCall(self, cfg, actor, name, a) {
       if (!Object.keys(d).length && !a.note) return { ok: true, task: pub(prev), changed: false };
       check(self, cfg, t, prev, actor);
       ensureQuota(self, cfg, actor, notifyTargets(t, prev, actor));
-      if (await githubCheck(self, t, prev)) {
-        // githubCheck awaited the network, so other calls may have run meanwhile. Optimistic concurrency:
-        // if the stored task is no longer exactly what we validated against, refuse instead of overwriting it.
-        // Nothing awaits between this re-read and save(), so the compare-and-write is atomic in the Durable Object.
-        if (JSON.stringify(get(self, prev.id)) !== JSON.stringify(prev)) throw rule("task was modified during verification, please retry; nothing was changed");
-        ensureQuota(self, cfg, actor, notifyTargets(t, prev, actor));
-      }
+      await githubCheck(self, t, prev);
+      const ci = t._ci || [];
       delete t._head_sha;
-      t.updated_at = now();
-      save(self, t);
-      log(self, t.id, actor, name === "task_claim" ? "claim" : "update", { ...d, note: a.note || undefined });
-      const github_check = prev.status !== t.status || prev.approved_sha !== t.approved_sha || prev.check_sha !== t.check_sha
-        ? await markDirty(self, [prev.approved_sha, t.approved_sha, prev.check_sha, t.check_sha]) : null;
-      return { ok: true, task: pub(t), changes: d, ...(github_check ? { github_check } : {}), woke: await notify(self, cfg, t, prev, actor) };
+      delete t._ci;
+      let github_check;
+      self.ctx.storage.transactionSync(() => {
+        unchanged(self, prev);
+        check(self, cfg, { ...t, _head_sha: normSha(a.head_sha) }, prev, actor);
+        ensureQuota(self, cfg, actor, notifyTargets(t, prev, actor));
+        t.updated_at = now();
+        save(self, t);
+        log(self, t.id, actor, name === "task_claim" ? "claim" : "update", { ...d, note: a.note || undefined });
+        if (t.status !== prev.status && ["approved", "merged"].includes(t.status)) audit(self, t.id, actor, t.status, t.approved_sha, { ci });
+        if (prev.status === "approved" && !["approved", "merged"].includes(t.status)) audit(self, t.id, actor, "approval_revoked", prev.approved_sha);
+        github_check = queueChecks(self, [prev.approved_sha, t.approved_sha, prev.check_sha, t.check_sha]);
+      });
+      if (github_check) await self.ctx.storage.setAlarm(Date.now());
+      return { ok: true, task: pub(get(self, t.id)), changes: d, ...(github_check ? { github_check } : {}), woke: await notify(self, cfg, t, prev, actor) };
     }
   } catch (e) {
     if (e instanceof RuleError) return { ok: false, error: e.message };

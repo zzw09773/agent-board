@@ -6,6 +6,9 @@
 //   APPROVERS           comma list allowed to move a task in_review -> approved
 //   MERGERS             comma list allowed to move approved -> merged (empty = anyone)
 //   DEFAULT_REVIEWER    reviewer when task_new omits one
+//   QA_REVIEWERS        identities authorized for independent QA (no owner/reviewer)
+//   RELEASE_APPROVERS   identities authorized to release a reviewed, QA-passed SHA
+//   REQUIRED_CI_CHECKS  JSON [{"name":"CI","app_id":15368}]; missing configuration blocks release/merge
 //   SENSITIVE_ALLOWLIST comma list of identities allowed to own data_level=sensitive tasks
 //   ALIASES             optional "alias=identity,alias2=identity2"
 //   RATE_PER_MINUTE     posts per identity per minute (default 30)
@@ -42,6 +45,8 @@ export function loadConfig(env) {
     aliases,
     approvers: list(env.APPROVERS),
     mergers: list(env.MERGERS),
+    qaReviewers: list(env.QA_REVIEWERS),
+    releaseApprovers: list(env.RELEASE_APPROVERS),
     defaultReviewer: env.DEFAULT_REVIEWER || null,
     sensitiveAllowlist: list(env.SENSITIVE_ALLOWLIST),
     ratePerMinute: parseInt(env.RATE_PER_MINUTE) || 30,

@@ -36,6 +36,10 @@ export class Board extends DurableObject {
     initOAuth(this.sql);
     initWeb(this.sql);
     initChecks(this.sql);
+    ctx.blockConcurrencyWhile(async () => {
+      const next = this.sql.exec("SELECT MIN(next_at) t FROM check_outbox WHERE gen>sent_gen").one().t;
+      if (next != null) await ctx.storage.setAlarm(Math.max(next, Date.now()));
+    });
   }
 
   // Delivers queued GitHub check runs (see checks.js); reschedules itself while anything is pending.
@@ -100,5 +104,5 @@ function instructions(cfg, me) {
   return `${cfg.boardName}: shared message board and task table. You are "${me}" (fixed by your key; you cannot post as anyone else). ` +
     `Valid recipients: ${cfg.identities.join(", ")}. Use board_post to message someone (it wakes them if they have a runner or webhook), ` +
     `board_read to read your threads, board_wait to long-poll for new messages to you. Max ${cfg.maxPostChars} chars per post. ` +
-    `Task tools: task_new/task_claim/task_update/task_list/task_get. Never post secrets or sensitive data on the board.`;
+    `Task tools: task_new/task_claim/task_update/task_attest/task_list/task_get. QA and explicit release on the approved SHA plus GitHub CI are required before merge. Never post secrets or sensitive data on the board.`;
 }
